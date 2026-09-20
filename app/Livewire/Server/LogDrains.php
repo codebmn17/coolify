@@ -52,7 +52,7 @@ class LogDrains extends Component
         }
     }
 
-    public function syncDataNewRelic(bool $toModel = false)
+    private function syncDataNewRelic(bool $toModel = false): void
     {
         if ($toModel) {
             $this->server->settings->is_logdrain_newrelic_enabled = $this->isLogDrainNewRelicEnabled;
@@ -65,7 +65,7 @@ class LogDrains extends Component
         }
     }
 
-    public function syncDataAxiom(bool $toModel = false)
+    private function syncDataAxiom(bool $toModel = false): void
     {
         if ($toModel) {
             $this->server->settings->is_logdrain_axiom_enabled = $this->isLogDrainAxiomEnabled;
@@ -78,7 +78,7 @@ class LogDrains extends Component
         }
     }
 
-    public function syncDataCustom(bool $toModel = false)
+    private function syncDataCustom(bool $toModel = false): void
     {
         if ($toModel) {
             $this->server->settings->is_logdrain_custom_enabled = $this->isLogDrainCustomEnabled;
@@ -91,7 +91,7 @@ class LogDrains extends Component
         }
     }
 
-    public function syncData(bool $toModel = false, ?string $type = null)
+    private function syncData(bool $toModel = false, ?string $type = null): void
     {
         if ($toModel) {
             $this->customValidation();
@@ -177,11 +177,11 @@ class LogDrains extends Component
         }
     }
 
-    public function submit(string $type)
+    public function submit()
     {
         try {
             $this->authorize('update', $this->server);
-            $this->syncData(true, $type);
+            $this->syncData(true);
             $this->dispatch('success', 'Settings saved.');
         } catch (\Throwable $e) {
             return handleError($e, $this);

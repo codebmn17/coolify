@@ -1,8 +1,6 @@
 # Versions
 # https://hub.docker.com/r/serversideup/php/tags?name=8.4-fpm-nginx-alpine
 ARG SERVERSIDEUP_PHP_VERSION=8.4-fpm-nginx-alpine
-# https://github.com/minio/mc/releases
-ARG MINIO_VERSION=RELEASE.2025-05-21T01-59-54Z
 # https://github.com/cloudflare/cloudflared/releases
 ARG CLOUDFLARED_VERSION=2025.7.0
 # https://www.postgresql.org/support/versioning/
@@ -14,7 +12,7 @@ ARG NGINX_VERSION=1.31.2-r1
 # =================================================================
 # Get MinIO client
 # =================================================================
-FROM minio/mc:${MINIO_VERSION} AS minio-client
+FROM ghcr.io/coollabsio/mx:0.1.0 AS minio-client
 
 # =================================================================
 # Final Stage: Production image
@@ -24,6 +22,7 @@ FROM serversideup/php:${SERVERSIDEUP_PHP_VERSION}
 ARG USER_ID
 ARG GROUP_ID
 ARG TARGETPLATFORM
+ARG TARGETARCH
 ARG POSTGRES_VERSION
 ARG CLOUDFLARED_VERSION
 ARG NGINX_VERSION
@@ -58,6 +57,7 @@ RUN apk upgrade --no-cache && \
 RUN apk add --no-cache \
     postgresql${POSTGRES_VERSION}-client \
     openssh-client \
+    openssl \
     git \
     git-lfs \
     jq \

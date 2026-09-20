@@ -47,7 +47,7 @@ class GithubPrivateRepositoryDeployKey extends Component
 
     public string $branch;
 
-    public $build_pack = 'nixpacks';
+    public $build_pack = 'railpack';
 
     public bool $show_is_static = true;
 
@@ -214,6 +214,14 @@ class GithubPrivateRepositoryDeployKey extends Component
 
         if ($validator->fails()) {
             throw new \RuntimeException('Invalid repository URL: '.$validator->errors()->first('repository_url'));
+        }
+
+        if (($scp = parseScpStyleGitUrl($this->repository_url)) !== null) {
+            $this->git_host = $scp['host'];
+            $this->git_repository = $this->repository_url;
+            $this->git_source = 'other';
+
+            return;
         }
 
         $this->repository_url_parsed = Url::fromString($this->repository_url);

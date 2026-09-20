@@ -12,6 +12,8 @@ use App\Models\GitlabApp;
 use App\Models\InstanceSettings;
 use App\Models\LocalFileVolume;
 use App\Models\LocalPersistentVolume;
+use App\Models\Project;
+use App\Models\S3Storage;
 use App\Models\Server;
 use App\Models\Service;
 use App\Models\ServiceApplication;
@@ -568,8 +570,11 @@ function refreshSession(?Team $team = null): void
             $team = Team::find($currentTeam->id);
         }
         if (! $team) {
-            // Fall back to any team the user still belongs to.
-            $team = User::query()->find(Auth::id())?->teams()->first();
+            // Fall back to the user's resolvable team (stored choice, or their
+            // sole team). Returns null for a multi-team user with no valid stored
+            // choice, so an arbitrary first team is never silently persisted —
+            // the user is sent to the selection screen instead.
+            $team = User::query()->find(Auth::id())?->resolveStoredTeam();
         }
     }
 
@@ -579,8 +584,13 @@ function refreshSession(?Team $team = null): void
     if (! $team) {
         // The user has no team left (e.g. just deleted their current team and
         // belongs to no other): clear the stale session reference instead of
-        // dereferencing null.
+        // dereferencing null, and drop the persisted choice so it is not
+        // restored on next login.
         session()->forget('currentTeam');
+        $user = Auth::user();
+        if ($user && ! is_null($user->current_team_id)) {
+            $user->forceFill(['current_team_id' => null])->saveQuietly();
+        }
 
         return;
     }
@@ -591,6 +601,15 @@ function refreshSession(?Team $team = null): void
         return $team;
     });
     session(['currentTeam' => $team]);
+
+    // Persist the active team so it can be restored after logout/login — but
+    // never while an admin is impersonating, so viewing another user's account
+    // does not overwrite that user's real last-active team.
+    $user = Auth::user();
+    if ($user && ! session('impersonating') && $user->current_team_id !== $team->id) {
+        $user->current_team_id = $team->id;
+        $user->saveQuietly();
+    }
 }
 function handleError(?Throwable $error = null, ?Component $livewire = null, ?string $customErrorMessage = null)
 {
@@ -749,19 +768,120 @@ function base_ip(): string
 
     return 'localhost';
 }
-function getFqdnWithoutPort(string $fqdn)
+/**
+ * Parse a domain URL into scheme/host/path pieces used by COOLIFY_* and SERVICE_* env builders.
+ * Omits a bare "/" path so port re-append stays valid ("http://host:80" not "http://host/:80").
+ *
+ * @return array{scheme: string, host: string, path: string}|null
+ */
+function parseDomainUrlParts(string $fqdn): ?array
 {
     try {
         $url = Url::fromString($fqdn);
         $host = $url->getHost();
-        $scheme = $url->getScheme();
-        $path = $url->getPath();
+        if ($host === '') {
+            return null;
+        }
 
-        return "$scheme://$host$path";
+        $path = $url->getPath();
+        if ($path === '' || $path === '/') {
+            $path = '';
+        }
+
+        return [
+            'scheme' => $url->getScheme(),
+            'host' => $host,
+            'path' => $path,
+        ];
     } catch (Throwable) {
-        return $fqdn;
+        return null;
     }
 }
+
+/**
+ * Absolute URL without port (and without a bare trailing slash).
+ * Used for COOLIFY_URL / SERVICE_URL base values.
+ */
+function getFqdnWithoutPort(string $fqdn): string
+{
+    $parts = parseDomainUrlParts($fqdn);
+    if ($parts === null || $parts['scheme'] === '') {
+        // Spatie accepts bare hostnames (empty scheme). Do not invent "://host".
+        return $fqdn;
+    }
+
+    return $parts['scheme'].'://'.$parts['host'].$parts['path'];
+}
+
+/**
+ * Host (+ optional path) without scheme or port.
+ * Used for COOLIFY_FQDN / SERVICE_FQDN base values.
+ */
+function getHostWithoutPort(string $fqdn): string
+{
+    $parts = parseDomainUrlParts($fqdn);
+    if ($parts === null) {
+        return $fqdn;
+    }
+
+    return $parts['host'].$parts['path'];
+}
+
+/**
+ * First entry from a comma-separated FQDN list (service apps may store multiple).
+ */
+function firstDomainFromList(?string $fqdns): string
+{
+    return trim((string) str($fqdns ?? '')->explode(',')->first());
+}
+function profile_avatar_url(User $user): string
+{
+    if ($user->avatar_storage_type === 's3') {
+        $url = s3_image_url($user->avatar_s3_storage_id, $user->avatar_path, $user->updated_at->timestamp);
+        if ($url) {
+            return $url;
+        }
+    }
+
+    return route('profile.avatar', ['v' => $user->updated_at->timestamp]);
+}
+
+function project_icon_url(Project $project): string
+{
+    if ($project->icon_storage_type === 's3') {
+        $url = s3_image_url($project->icon_s3_storage_id, $project->icon_path, $project->updated_at->timestamp);
+        if ($url) {
+            return $url;
+        }
+    }
+
+    return route('project.icon', [
+        'project_uuid' => $project->uuid,
+        'v' => $project->updated_at->timestamp,
+    ]);
+}
+
+function s3_image_url(?int $storageId, ?string $path, int $version): ?string
+{
+    if (! $storageId || blank($path)) {
+        return null;
+    }
+
+    $storage = S3Storage::query()
+        ->whereKey($storageId)
+        ->whereTeamId(0)
+        ->where('is_usable', true)
+        ->first();
+
+    if (! $storage) {
+        return null;
+    }
+
+    $baseUrl = instanceSettings()->image_cdn_url ?: $storage->awsUrl();
+
+    return rtrim($baseUrl, '/').'/'.ltrim($path, '/').'?v='.$version;
+}
+
 /**
  * If fqdn is set, return it, otherwise return public ip.
  */
@@ -1263,23 +1383,92 @@ function sslip(Server $server)
     return "http://{$server->ip}.sslip.io";
 }
 
+function service_templates_cache_key(): string
+{
+    return (string) config('constants.services.cache_key', 'coolify:service-templates-bundle');
+}
+
+function service_templates_path(): string
+{
+    return base_path('templates/'.config('constants.services.file_name'));
+}
+
+/**
+ * Persist the CDN service-templates bundle to local disk and shared cache.
+ *
+ * The shared cache entry is what multi-node Cloud relies on: Horizon (or any
+ * single node) pulls once; every HTTP node reads the same Redis payload.
+ */
+function store_service_templates_bundle(string $json, ?string $fetchedAt = null): bool
+{
+    $fetchedAt ??= now()->toIso8601String();
+    $path = service_templates_path();
+
+    $written = File::put($path, $json) !== false;
+
+    Cache::forever(service_templates_cache_key(), [
+        'fetched_at' => $fetchedAt,
+        'json' => $json,
+    ]);
+
+    return $written;
+}
+
+function get_service_templates_fetched_at(): ?CarbonImmutable
+{
+    $bundle = Cache::get(service_templates_cache_key());
+    if (is_array($bundle) && filled(data_get($bundle, 'fetched_at'))) {
+        try {
+            return CarbonImmutable::parse((string) data_get($bundle, 'fetched_at'));
+        } catch (Throwable) {
+            // fall through to local file mtime
+        }
+    }
+
+    $path = service_templates_path();
+    if (File::exists($path)) {
+        $mtime = filemtime($path);
+        if ($mtime !== false) {
+            return CarbonImmutable::createFromTimestamp($mtime);
+        }
+    }
+
+    return null;
+}
+
 function get_service_templates(bool $force = false): Collection
 {
     if ($force) {
         try {
-            $response = Http::retry(3, 1000)->get(config('constants.services.official'));
+            $response = Http::retry(3, 1000, throw: false)
+                ->timeout(60)
+                ->connectTimeout(10)
+                ->get(config('constants.services.official'));
             if ($response->failed()) {
                 return collect([]);
             }
-            $services = $response->json();
+            store_service_templates_bundle($response->body());
 
-            return collect($services);
+            return collect(json_decode($response->body()))->sortKeys();
         } catch (Throwable) {
             return get_service_templates();
         }
     }
 
-    $path = base_path('templates/'.config('constants.services.file_name'));
+    $bundle = Cache::get(service_templates_cache_key());
+    if (is_array($bundle) && is_string(data_get($bundle, 'json')) && data_get($bundle, 'json') !== '') {
+        $fetchedAt = (string) data_get($bundle, 'fetched_at', '0');
+
+        return Cache::remember("service-templates:shared:{$fetchedAt}", now()->addDay(), function () use ($bundle) {
+            return collect(json_decode((string) data_get($bundle, 'json')))->sortKeys();
+        });
+    }
+
+    $path = service_templates_path();
+    if (! File::exists($path)) {
+        return collect([]);
+    }
+
     $mtime = filemtime($path) ?: 0;
 
     return Cache::remember("service-templates:{$mtime}", now()->addDay(), function () use ($path) {
@@ -1746,11 +1935,189 @@ function getRealtime()
     }
 }
 
+/**
+ * Resolve a server IP or hostname to an IP address for DNS comparison/display.
+ *
+ * When a server uses a hostname (e.g. coolify-testing-host) instead of a literal
+ * IP, A-record validation and UI copy need the actual IP the user should point DNS to.
+ *
+ * Successful hostname resolutions are cached briefly so Livewire mounts/domain state
+ * loads do not re-query DNS on every request.
+ *
+ * @return array{ip: ?string, configured: ?string, resolved_from_hostname: bool}
+ */
+function resolveServerIpAddress(?string $ipOrHost): array
+{
+    $configured = filled($ipOrHost) ? trim((string) $ipOrHost) : null;
+
+    if ($configured === null || $configured === '') {
+        return [
+            'ip' => null,
+            'configured' => null,
+            'resolved_from_hostname' => false,
+        ];
+    }
+
+    // Strip IPv6 brackets if present: [2001:db8::1]
+    $candidate = str($configured)->trim('[]')->toString();
+
+    if (filter_var($candidate, FILTER_VALIDATE_IP) !== false) {
+        return [
+            'ip' => $candidate,
+            'configured' => $configured,
+            'resolved_from_hostname' => false,
+        ];
+    }
+
+    $cacheKey = 'server-ip-resolve:'.mb_strtolower($candidate);
+    $cachedIp = Cache::get($cacheKey);
+
+    if (is_string($cachedIp) && filter_var($cachedIp, FILTER_VALIDATE_IP) !== false) {
+        return [
+            'ip' => $cachedIp,
+            'configured' => $configured,
+            'resolved_from_hostname' => true,
+        ];
+    }
+
+    $resolvedIp = null;
+
+    try {
+        $aRecords = @dns_get_record($candidate, DNS_A);
+        if (is_array($aRecords)) {
+            foreach ($aRecords as $record) {
+                $ip = $record['ip'] ?? null;
+                if (is_string($ip) && filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4) !== false) {
+                    $resolvedIp = $ip;
+                    break;
+                }
+            }
+        }
+    } catch (Throwable) {
+    }
+
+    if ($resolvedIp === null) {
+        try {
+            $aaaaRecords = @dns_get_record($candidate, DNS_AAAA);
+            if (is_array($aaaaRecords)) {
+                foreach ($aaaaRecords as $record) {
+                    $ip = $record['ipv6'] ?? null;
+                    if (is_string($ip) && filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV6) !== false) {
+                        $resolvedIp = $ip;
+                        break;
+                    }
+                }
+            }
+        } catch (Throwable) {
+        }
+    }
+
+    if ($resolvedIp === null) {
+        $resolved = @gethostbyname($candidate);
+        if (is_string($resolved) && $resolved !== $candidate && filter_var($resolved, FILTER_VALIDATE_IP) !== false) {
+            $resolvedIp = $resolved;
+        }
+    }
+
+    if ($resolvedIp !== null) {
+        Cache::put($cacheKey, $resolvedIp, now()->addSeconds(60));
+    }
+
+    return [
+        'ip' => $resolvedIp,
+        'configured' => $configured,
+        'resolved_from_hostname' => $resolvedIp !== null,
+    ];
+}
+
+/**
+ * Preferred server address for DNS validation: public instance IPs for localhost,
+ * otherwise the server IP/hostname resolved to a real IP when possible.
+ */
+function serverDnsTargetIp(Server $server): ?string
+{
+    $settings = instanceSettings();
+
+    if ($server->id === 0) {
+        $configured = data_get($settings, 'public_ipv4')
+            ?: data_get($settings, 'public_ipv6')
+            ?: $server->ip;
+    } else {
+        $configured = $server->ip;
+    }
+
+    $resolved = resolveServerIpAddress(is_string($configured) ? $configured : null);
+
+    // Prefer resolved IP; fall back to configured value so existing hostname-based
+    // comparisons still have something to show if DNS resolution fails.
+    return $resolved['ip'] ?? $resolved['configured'];
+}
+
+/**
+ * DNS record type users should create for a server address: A (IPv4) or AAAA (IPv6).
+ */
+function dnsRecordTypeForIp(?string $ipOrHost): string
+{
+    if (! is_string($ipOrHost) || trim($ipOrHost) === '') {
+        return 'A';
+    }
+
+    // Accept labels like "2001:db8::1 (hostname)" or bracketed IPv6.
+    $candidate = trim($ipOrHost);
+    if (preg_match('/^(\S+)/', $candidate, $matches) === 1) {
+        $candidate = $matches[1];
+    }
+    $candidate = str($candidate)->trim('[]')->toString();
+
+    if (filter_var($candidate, FILTER_VALIDATE_IP, FILTER_FLAG_IPV6) !== false) {
+        return 'AAAA';
+    }
+
+    return 'A';
+}
+
+/**
+ * Bare address for DNS guidance (first token of a label, brackets stripped).
+ */
+function dnsGuidanceTargetAddress(?string $ipOrLabel): ?string
+{
+    if (! is_string($ipOrLabel) || trim($ipOrLabel) === '') {
+        return null;
+    }
+
+    $candidate = trim($ipOrLabel);
+    if (preg_match('/^(\S+)/', $candidate, $matches) === 1) {
+        $candidate = $matches[1];
+    }
+    $candidate = str($candidate)->trim('[]')->toString();
+
+    return $candidate !== '' ? $candidate : null;
+}
+
+/**
+ * User-facing guidance when a hostname does not resolve to the server.
+ * Format: "Required DNS record type A pointing to 1.2.3.4"
+ * or "Required DNS record type AAAA pointing to 2001:db8::1".
+ *
+ * @param  ?string  $targetLabel  Display target (IP, or "IP (hostname)") used as fallback.
+ * @param  ?string  $ipForRecordType  Preferred IP for type + display (defaults to $targetLabel).
+ */
+function dnsMismatchGuidanceMessage(?string $targetLabel, ?string $ipForRecordType = null): string
+{
+    $address = dnsGuidanceTargetAddress($ipForRecordType)
+        ?? dnsGuidanceTargetAddress($targetLabel);
+
+    if ($address === null) {
+        return 'DNS validation failed. Check your DNS records.';
+    }
+
+    $recordType = dnsRecordTypeForIp($address);
+
+    return "Required DNS record type {$recordType} pointing to {$address}";
+}
+
 function validateDNSEntry(string $fqdn, Server $server)
 {
-    // https://www.cloudflare.com/ips-v4/#
-    $cloudflare_ips = collect(['173.245.48.0/20', '103.21.244.0/22', '103.22.200.0/22', '103.31.4.0/22', '141.101.64.0/18', '108.162.192.0/18', '190.93.240.0/20', '188.114.96.0/20', '197.234.240.0/22', '198.41.128.0/17', '162.158.0.0/15', '104.16.0.0/13', '172.64.0.0/13', '131.0.72.0/22']);
-
     $url = Url::fromString($fqdn);
     $host = $url->getHost();
     if (str($host)->contains('sslip.io')) {
@@ -1763,28 +2130,24 @@ function validateDNSEntry(string $fqdn, Server $server)
     }
     $dns_servers = data_get($settings, 'custom_dns_servers');
     $dns_servers = str($dns_servers)->explode(',');
-    if ($server->id === 0) {
-        $ip = data_get($settings, 'public_ipv4', data_get($settings, 'public_ipv6', $server->ip));
-    } else {
-        $ip = $server->ip;
-    }
+    $ip = serverDnsTargetIp($server);
     $found_matching_ip = false;
-    $type = DNSTypes::NAME_A;
+    $type = dnsRecordTypeForIp($ip) === 'AAAA' ? DNSTypes::NAME_AAAA : DNSTypes::NAME_A;
     foreach ($dns_servers as $dns_server) {
         try {
-            $query = new DNSQuery($dns_server);
+            $query = createDnsQuery($dns_server);
             $results = $query->query($host, $type);
             if ($results === false || $query->hasError()) {
             } else {
                 foreach ($results as $result) {
                     if ($result->getType() == $type) {
-                        if (ipMatch($result->getData(), $cloudflare_ips->toArray(), $match)) {
+                        if (isCloudflareIp($result->getData())) {
                             $found_matching_ip = true;
-                            break;
+                            break 2;
                         }
-                        if ($result->getData() === $ip) {
+                        if ($ip && $result->getData() === $ip) {
                             $found_matching_ip = true;
-                            break;
+                            break 2;
                         }
                     }
                 }
@@ -1796,11 +2159,57 @@ function validateDNSEntry(string $fqdn, Server $server)
     return $found_matching_ip;
 }
 
+function createDnsQuery(string $dnsServer): DNSQuery
+{
+    return app()->make(DNSQuery::class, [
+        'server' => $dnsServer,
+        'port' => 53,
+        'timeout' => 5,
+    ]);
+}
+
+function isCloudflareIp(string $ip): bool
+{
+    // https://www.cloudflare.com/ips/
+    $cloudflareIps = [
+        '173.245.48.0/20', '103.21.244.0/22', '103.22.200.0/22', '103.31.4.0/22',
+        '141.101.64.0/18', '108.162.192.0/18', '190.93.240.0/20', '188.114.96.0/20',
+        '197.234.240.0/22', '198.41.128.0/17', '162.158.0.0/15', '104.16.0.0/13',
+        '172.64.0.0/13', '131.0.72.0/22', '2400:cb00::/32', '2606:4700::/32',
+        '2803:f800::/32', '2405:b500::/32', '2405:8100::/32', '2a06:98c0::/29',
+        '2c0f:f248::/32',
+    ];
+
+    return ipMatch($ip, $cloudflareIps);
+}
+
 function ipMatch($ip, $cidrs, &$match = null)
 {
     foreach ((array) $cidrs as $cidr) {
-        [$subnet, $mask] = explode('/', $cidr);
-        if (((ip2long($ip) & ($mask = ~((1 << (32 - $mask)) - 1))) == (ip2long($subnet) & $mask))) {
+        [$subnet, $prefixLength] = explode('/', $cidr);
+        $packedIp = inet_pton($ip);
+        $packedSubnet = inet_pton($subnet);
+
+        if ($packedIp === false || $packedSubnet === false || strlen($packedIp) !== strlen($packedSubnet)) {
+            continue;
+        }
+
+        $addressBits = strlen($packedIp) * 8;
+        $prefixLength = (int) $prefixLength;
+        if ($prefixLength < 0 || $prefixLength > $addressBits) {
+            continue;
+        }
+
+        $fullBytes = intdiv($prefixLength, 8);
+        $remainingBits = $prefixLength % 8;
+        $matches = substr($packedIp, 0, $fullBytes) === substr($packedSubnet, 0, $fullBytes);
+
+        if ($matches && $remainingBits > 0) {
+            $mask = (0xFF << (8 - $remainingBits)) & 0xFF;
+            $matches = (ord($packedIp[$fullBytes]) & $mask) === (ord($packedSubnet[$fullBytes]) & $mask);
+        }
+
+        if ($matches) {
             $match = $cidr;
 
             return true;
@@ -1991,7 +2400,7 @@ function get_public_ips()
     }
 }
 
-function isAnyDeploymentInprogress()
+function isAnyDeploymentInprogress(bool $showAll = false)
 {
     $runningJobs = ApplicationDeploymentQueue::where('horizon_job_worker', gethostname())->where('status', ApplicationDeploymentStatus::IN_PROGRESS->value)->get();
 
@@ -2008,34 +2417,31 @@ function isAnyDeploymentInprogress()
         if ($horizonJobStatus === 'unknown' || $horizonJobStatus === 'reserved') {
             $horizonJobIds[] = $runningJob->horizon_job_id;
 
-            // Get application and team information
-            $application = Application::find($runningJob->application_id);
-            $teamMembers = [];
-            $deploymentUrl = '';
+            if ($showAll) {
+                $application = Application::find($runningJob->application_id);
+                $teamMembers = [];
+                $deploymentUrl = '';
 
-            if ($application) {
-                // Get team members through the application's project
-                $team = $application->team();
-                if ($team) {
-                    $teamMembers = $team->members()->pluck('email')->toArray();
+                if ($application) {
+                    $team = $application->team();
+                    if ($team) {
+                        $teamMembers = $team->members()->pluck('email')->toArray();
+                    }
+
+                    if ($runningJob->deployment_url) {
+                        $deploymentUrl = base_url().$runningJob->deployment_url;
+                    }
                 }
 
-                // Construct the full deployment URL
-                if ($runningJob->deployment_url) {
-                    $baseUrl = base_url();
-                    $deploymentUrl = $baseUrl.$runningJob->deployment_url;
-                }
+                $deploymentDetails[] = [
+                    'application_name' => $runningJob->application_name ?? 'Unknown',
+                    'server_name' => $runningJob->server_name ?? 'Unknown',
+                    'deployment_url' => $deploymentUrl,
+                    'team_members' => $teamMembers,
+                    'created_at' => $runningJob->created_at->format('Y-m-d H:i:s'),
+                    'horizon_job_id' => $runningJob->horizon_job_id,
+                ];
             }
-
-            $deploymentDetails[] = [
-                'id' => $runningJob->id,
-                'application_name' => $runningJob->application_name ?? 'Unknown',
-                'server_name' => $runningJob->server_name ?? 'Unknown',
-                'deployment_url' => $deploymentUrl,
-                'team_members' => $teamMembers,
-                'created_at' => $runningJob->created_at->format('Y-m-d H:i:s'),
-                'horizon_job_id' => $runningJob->horizon_job_id,
-            ];
         }
     }
 
@@ -2044,28 +2450,39 @@ function isAnyDeploymentInprogress()
         exit(0);
     }
 
-    // Display enhanced deployment information
-    echo "\n=== Running Deployments ===\n";
-    echo 'Total active deployments: '.count($horizonJobIds)."\n\n";
-
-    foreach ($deploymentDetails as $index => $deployment) {
-        echo 'Deployment #'.($index + 1).":\n";
-        echo '  Application: '.$deployment['application_name']."\n";
-        echo '  Server: '.$deployment['server_name']."\n";
-        echo '  Started: '.$deployment['created_at']."\n";
-        if ($deployment['deployment_url']) {
-            echo '  URL: '.$deployment['deployment_url']."\n";
-        }
-        if (! empty($deployment['team_members'])) {
-            echo '  Team members: '.implode(', ', $deployment['team_members'])."\n";
-        } else {
-            echo "  Team members: No team members found\n";
-        }
-        echo '  Horizon Job ID: '.$deployment['horizon_job_id']."\n";
-        echo "\n";
-    }
+    echo formatRunningDeploymentsOutput(count($horizonJobIds), $deploymentDetails, $showAll);
 
     exit(1);
+}
+
+function formatRunningDeploymentsOutput(int $activeDeploymentCount, array $deploymentDetails = [], bool $showAll = false): string
+{
+    $output = "\n=== Running Deployments ===\n";
+    $output .= 'Total active deployments: '.$activeDeploymentCount."\n";
+
+    if (! $showAll) {
+        return $output;
+    }
+
+    $output .= "\n";
+
+    foreach ($deploymentDetails as $index => $deployment) {
+        $output .= 'Deployment #'.($index + 1).":\n";
+        $output .= '  Application: '.$deployment['application_name']."\n";
+        $output .= '  Server: '.$deployment['server_name']."\n";
+        $output .= '  Started: '.$deployment['created_at']."\n";
+        if ($deployment['deployment_url']) {
+            $output .= '  URL: '.$deployment['deployment_url']."\n";
+        }
+        if (! empty($deployment['team_members'])) {
+            $output .= '  Team members: '.implode(', ', $deployment['team_members'])."\n";
+        } else {
+            $output .= "  Team members: No team members found\n";
+        }
+        $output .= '  Horizon Job ID: '.$deployment['horizon_job_id']."\n\n";
+    }
+
+    return $output;
 }
 
 function isBase64Encoded($strValue)
@@ -2094,7 +2511,6 @@ function parseDockerComposeFile(Service|Application $resource, bool $isNew = fal
             } catch (Exception $e) {
                 throw new RuntimeException($e->getMessage());
             }
-            $allServices = get_service_templates();
             $topLevelVolumes = collect(data_get($yaml, 'volumes', []));
             $topLevelNetworks = collect(data_get($yaml, 'networks', []));
             $topLevelConfigs = collect(data_get($yaml, 'configs', []));
@@ -2120,25 +2536,8 @@ function parseDockerComposeFile(Service|Application $resource, bool $isNew = fal
                 }
                 $topLevelVolumes = collect($tempTopLevelVolumes);
             }
-            $services = collect($services)->map(function ($service, $serviceName) use ($topLevelVolumes, $topLevelNetworks, $definedNetwork, $isNew, $generatedServiceFQDNS, $resource, $allServices, $envComments) {
-                // Workarounds for beta users.
-                if ($serviceName === 'registry') {
-                    $tempServiceName = 'docker-registry';
-                } else {
-                    $tempServiceName = $serviceName;
-                }
-                if (str(data_get($service, 'image'))->contains('glitchtip')) {
-                    $tempServiceName = 'glitchtip';
-                }
-                if ($serviceName === 'supabase-kong') {
-                    $tempServiceName = 'supabase';
-                }
-                $serviceDefinition = data_get($allServices, $tempServiceName);
-                $predefinedPort = data_get($serviceDefinition, 'port');
-                if ($serviceName === 'plausible') {
-                    $predefinedPort = '8000';
-                }
-                // End of workarounds for beta users.
+            $services = collect($services)->map(function ($service, $serviceName) use ($topLevelVolumes, $topLevelNetworks, $definedNetwork, $isNew, $generatedServiceFQDNS, $resource, $envComments) {
+                $predefinedPort = $resource->getRequiredPort();
                 $serviceVolumes = collect(data_get($service, 'volumes', []));
                 $servicePorts = collect(data_get($service, 'ports', []));
                 $serviceNetworks = collect(data_get($service, 'networks', []));
@@ -2538,7 +2937,7 @@ function parseDockerComposeFile(Service|Application $resource, bool $isNew = fal
                             if ($env) {
                                 $env_url = Url::fromString($savedService->fqdn);
                                 $env_port = $env_url->getPort();
-                                if ($env_port !== $predefinedPort) {
+                                if ((int) $env_port !== (int) $predefinedPort) {
                                     $env_url = $env_url->withPort($predefinedPort);
                                     $savedService->fqdn = $env_url->__toString();
                                     $savedService->save();
@@ -2623,7 +3022,7 @@ function parseDockerComposeFile(Service|Application $resource, bool $isNew = fal
                                             if ($env) {
                                                 $env_url = Url::fromString($env->value);
                                                 $env_port = $env_url->getPort();
-                                                if ($env_port !== $predefinedPort) {
+                                                if ((int) $env_port !== (int) $predefinedPort) {
                                                     $env_url = $env_url->withPort($predefinedPort);
                                                     $savedService->fqdn = $env_url->__toString();
                                                     $savedService->save();
@@ -2690,6 +3089,9 @@ function parseDockerComposeFile(Service|Application $resource, bool $isNew = fal
                 } else {
                     $fqdns = collect(data_get($savedService, 'fqdns'))->filter();
                 }
+                $noindexDomains = $savedService instanceof ServiceApplication
+                    ? $savedService->noindexDomains()
+                    : collect([]);
                 $defaultLabels = defaultLabels(
                     id: $resource->id,
                     name: $containerName,
@@ -2705,18 +3107,31 @@ function parseDockerComposeFile(Service|Application $resource, bool $isNew = fal
                 if (! $isDatabase && $fqdns->count() > 0) {
                     if ($fqdns) {
                         $shouldGenerateLabelsExactly = $resource->server->settings->generate_exact_labels;
+                        $redirectDirection = in_array(data_get($savedService, 'redirect'), ['www', 'non-www', 'both'], true)
+                            ? data_get($savedService, 'redirect')
+                            : 'both';
+                        $domainPortOverrides = $savedService instanceof ServiceApplication
+                            ? ($savedService->domain_port_overrides ?? [])
+                            : [];
+                        $onlyPort = $savedService instanceof ServiceApplication
+                            ? $savedService->getRequiredPort()
+                            : $predefinedPort;
                         if ($shouldGenerateLabelsExactly) {
                             switch ($resource->server->proxyType()) {
                                 case ProxyTypes::TRAEFIK->value:
                                     $serviceLabels = $serviceLabels->merge(fqdnLabelsForTraefik(
                                         uuid: $resource->uuid,
                                         domains: $fqdns,
-                                        is_force_https_enabled: true,
+                                        is_force_https_enabled: $savedService->isForceHttpsEnabled(),
                                         serviceLabels: $serviceLabels,
                                         is_gzip_enabled: $savedService->isGzipEnabled(),
                                         is_stripprefix_enabled: $savedService->isStripprefixEnabled(),
                                         service_name: $serviceName,
-                                        image: data_get($service, 'image')
+                                        image: data_get($service, 'image'),
+                                        onlyPort: $onlyPort,
+                                        noindex_domains: $noindexDomains,
+                                        redirect_direction: $redirectDirection,
+                                        domainPortOverrides: $domainPortOverrides,
                                     ));
                                     break;
                                 case ProxyTypes::CADDY->value:
@@ -2724,12 +3139,17 @@ function parseDockerComposeFile(Service|Application $resource, bool $isNew = fal
                                         network: $resource->destination->network,
                                         uuid: $resource->uuid,
                                         domains: $fqdns,
-                                        is_force_https_enabled: true,
+                                        is_force_https_enabled: $savedService->isForceHttpsEnabled(),
                                         serviceLabels: $serviceLabels,
                                         is_gzip_enabled: $savedService->isGzipEnabled(),
                                         is_stripprefix_enabled: $savedService->isStripprefixEnabled(),
                                         service_name: $serviceName,
-                                        image: data_get($service, 'image')
+                                        image: data_get($service, 'image'),
+                                        onlyPort: $onlyPort,
+                                        predefinedPort: $onlyPort,
+                                        noindex_domains: $noindexDomains,
+                                        redirect_direction: $redirectDirection,
+                                        domainPortOverrides: $domainPortOverrides,
                                     ));
                                     break;
                             }
@@ -2737,23 +3157,32 @@ function parseDockerComposeFile(Service|Application $resource, bool $isNew = fal
                             $serviceLabels = $serviceLabels->merge(fqdnLabelsForTraefik(
                                 uuid: $resource->uuid,
                                 domains: $fqdns,
-                                is_force_https_enabled: true,
+                                is_force_https_enabled: $savedService->isForceHttpsEnabled(),
                                 serviceLabels: $serviceLabels,
                                 is_gzip_enabled: $savedService->isGzipEnabled(),
                                 is_stripprefix_enabled: $savedService->isStripprefixEnabled(),
                                 service_name: $serviceName,
-                                image: data_get($service, 'image')
+                                image: data_get($service, 'image'),
+                                onlyPort: $onlyPort,
+                                noindex_domains: $noindexDomains,
+                                redirect_direction: $redirectDirection,
+                                domainPortOverrides: $domainPortOverrides,
                             ));
                             $serviceLabels = $serviceLabels->merge(fqdnLabelsForCaddy(
                                 network: $resource->destination->network,
                                 uuid: $resource->uuid,
                                 domains: $fqdns,
-                                is_force_https_enabled: true,
+                                is_force_https_enabled: $savedService->isForceHttpsEnabled(),
                                 serviceLabels: $serviceLabels,
                                 is_gzip_enabled: $savedService->isGzipEnabled(),
                                 is_stripprefix_enabled: $savedService->isStripprefixEnabled(),
                                 service_name: $serviceName,
-                                image: data_get($service, 'image')
+                                image: data_get($service, 'image'),
+                                onlyPort: $onlyPort,
+                                predefinedPort: $onlyPort,
+                                noindex_domains: $noindexDomains,
+                                redirect_direction: $redirectDirection,
+                                domainPortOverrides: $domainPortOverrides,
                             ));
                         }
                     }
@@ -3444,41 +3873,56 @@ function parseDockerComposeFile(Service|Application $resource, bool $isNew = fal
             if ($resource->serviceType()) {
                 $fqdns = generateServiceSpecificFqdns($resource);
             } else {
-                $domains = collect(json_decode($resource->docker_compose_domains)) ?? [];
+                $domains = json_decode($resource->docker_compose_domains ?: '[]', true) ?: [];
                 if ($domains) {
-                    $fqdns = data_get($domains, "$serviceName.domain");
+                    // Dual-read: original compose name or legacy underscore key.
+                    $fqdns = getComposeServiceDomainString($domains, (string) $serviceName);
                     if ($fqdns) {
                         $fqdns = str($fqdns)->explode(',');
                         if ($pull_request_id !== 0) {
                             $preview = $resource->previews()->find($preview_id);
-                            $docker_compose_domains = collect(json_decode(data_get($preview, 'docker_compose_domains')));
-                            if ($docker_compose_domains->count() > 0) {
-                                $found_fqdn = data_get($docker_compose_domains, "$serviceName.domain");
+                            if (! $preview) {
+                                try {
+                                    $preview = ApplicationPreview::findPreviewByApplicationAndPullId($resource->id, $pull_request_id);
+                                } catch (ModelNotFoundException) {
+                                    throw new RuntimeException('Preview not found.');
+                                }
+                            }
+                            $docker_compose_domains = json_decode(data_get($preview, 'docker_compose_domains') ?: '[]', true) ?: [];
+                            if (count($docker_compose_domains) > 0) {
+                                $found_fqdn = getComposeServiceDomainString($docker_compose_domains, (string) $serviceName);
                                 if ($found_fqdn) {
-                                    $fqdns = collect($found_fqdn);
+                                    $fqdns = str($found_fqdn)->explode(',')->map(fn ($fqdn) => trim($fqdn))->filter();
                                 } else {
                                     $fqdns = collect([]);
                                 }
                             } else {
-                                $fqdns = $fqdns->map(function ($fqdn) use ($pull_request_id, $resource) {
-                                    $preview = ApplicationPreview::findPreviewByApplicationAndPullId($resource->id, $pull_request_id);
-                                    $url = Url::fromString($fqdn);
-                                    $template = $resource->preview_url_template;
-                                    $host = $url->getHost();
-                                    $schema = $url->getScheme();
-                                    $random = new_public_id();
-                                    $preview_fqdn = str_replace('{{random}}', $random, $template);
-                                    $preview_fqdn = str_replace('{{domain}}', $host, $preview_fqdn);
-                                    $preview_fqdn = str_replace('{{pr_id}}', $pull_request_id, $preview_fqdn);
-                                    $preview_fqdn = "$schema://$preview_fqdn";
-                                    $preview->fqdn = $preview_fqdn;
-                                    $preview->save();
-
-                                    return $preview_fqdn;
-                                });
+                                $generatedDomains = $fqdns->map(
+                                    fn ($fqdn) => $preview->generatedPreviewDomain((string) $fqdn)
+                                );
+                                $fqdns = $generatedDomains->pluck('url');
+                                $preview->fqdn = $fqdns->implode(',');
+                                $generatedOverrides = $generatedDomains
+                                    ->filter(fn (array $generated): bool => filled($generated['port']))
+                                    ->mapWithKeys(fn (array $generated): array => [$generated['url'] => $generated['port']])
+                                    ->all();
+                                $preview->domain_port_overrides = array_replace(
+                                    $preview->domain_port_overrides ?? [],
+                                    $generatedOverrides,
+                                );
+                                $preview->save();
                             }
                         }
+                        $noindexDomains = $pull_request_id !== 0 ? $fqdns : $resource->noindexDomains();
                         $shouldGenerateLabelsExactly = $server->settings->generate_exact_labels;
+                        $composeRedirect = data_get($domains, "$serviceName.redirect");
+                        $redirectDirection = in_array($composeRedirect, ['www', 'non-www', 'both'], true)
+                            ? $composeRedirect
+                            : 'both';
+                        $domainPortOverrides = $pull_request_id === 0
+                            ? ($resource->domain_port_overrides ?? [])
+                            : ($preview?->domain_port_overrides ?? []);
+                        $onlyPort = firstDockerComposeServicePort($service);
                         if ($shouldGenerateLabelsExactly) {
                             switch ($server->proxyType()) {
                                 case ProxyTypes::TRAEFIK->value:
@@ -3492,6 +3936,10 @@ function parseDockerComposeFile(Service|Application $resource, bool $isNew = fal
                                             is_force_https_enabled: $resource->isForceHttpsEnabled(),
                                             is_gzip_enabled: $resource->isGzipEnabled(),
                                             is_stripprefix_enabled: $resource->isStripprefixEnabled(),
+                                            onlyPort: $onlyPort,
+                                            noindex_domains: $noindexDomains,
+                                            redirect_direction: $redirectDirection,
+                                            domainPortOverrides: $domainPortOverrides,
                                         )
                                     );
                                     break;
@@ -3506,6 +3954,10 @@ function parseDockerComposeFile(Service|Application $resource, bool $isNew = fal
                                             is_force_https_enabled: $resource->isForceHttpsEnabled(),
                                             is_gzip_enabled: $resource->isGzipEnabled(),
                                             is_stripprefix_enabled: $resource->isStripprefixEnabled(),
+                                            onlyPort: $onlyPort,
+                                            noindex_domains: $noindexDomains,
+                                            redirect_direction: $redirectDirection,
+                                            domainPortOverrides: $domainPortOverrides,
                                         )
                                     );
                                     break;
@@ -3521,6 +3973,10 @@ function parseDockerComposeFile(Service|Application $resource, bool $isNew = fal
                                     is_force_https_enabled: $resource->isForceHttpsEnabled(),
                                     is_gzip_enabled: $resource->isGzipEnabled(),
                                     is_stripprefix_enabled: $resource->isStripprefixEnabled(),
+                                    onlyPort: $onlyPort,
+                                    noindex_domains: $noindexDomains,
+                                    redirect_direction: $redirectDirection,
+                                    domainPortOverrides: $domainPortOverrides,
                                 )
                             );
                             $serviceLabels = $serviceLabels->merge(
@@ -3533,6 +3989,10 @@ function parseDockerComposeFile(Service|Application $resource, bool $isNew = fal
                                     is_force_https_enabled: $resource->isForceHttpsEnabled(),
                                     is_gzip_enabled: $resource->isGzipEnabled(),
                                     is_stripprefix_enabled: $resource->isStripprefixEnabled(),
+                                    onlyPort: $onlyPort,
+                                    noindex_domains: $noindexDomains,
+                                    redirect_direction: $redirectDirection,
+                                    domainPortOverrides: $domainPortOverrides,
                                 )
                             );
                         }
@@ -3782,14 +4242,23 @@ function coolifyHelperImage(): string
 
 function getHelperVersion(): string
 {
-    $settings = instanceSettings();
+    $configuredHelperVersion = config('constants.coolify.helper_version');
 
-    // In development mode, use the dev_helper_version if set, otherwise fallback to config
-    if (isDev() && ! empty($settings->dev_helper_version)) {
-        return $settings->dev_helper_version;
+    if (isDev()) {
+        $devHelperVersion = InstanceSettings::query()->whereKey(0)->value('dev_helper_version');
+
+        if (! empty($devHelperVersion)) {
+            return $devHelperVersion;
+        }
     }
 
-    return config('constants.coolify.helper_version');
+    $fetchedHelperVersion = InstanceSettings::query()->whereKey(0)->value('helper_version');
+
+    if (! empty($fetchedHelperVersion) && version_compare($fetchedHelperVersion, $configuredHelperVersion, '>')) {
+        return $fetchedHelperVersion;
+    }
+
+    return $configuredHelperVersion;
 }
 
 function loggy($message = null, array $context = [])
@@ -3803,8 +4272,17 @@ function loggy($message = null, array $context = [])
 
     return app('log')->debug($message, $context);
 }
-function sslipDomainWarning(string $domains)
+/**
+ * Warn when any domain uses HTTPS with an sslip hostname.
+ *
+ * Empty/null domain lists are valid (domains removed) and produce no warning.
+ */
+function sslipDomainWarning(?string $domains): bool
 {
+    if (blank($domains)) {
+        return false;
+    }
+
     $domains = str($domains)->trim()->explode(',');
     $showSslipHttpsWarning = false;
     $domains->each(function ($domain) use (&$showSslipHttpsWarning) {
@@ -3896,6 +4374,62 @@ NGINX;
     }
 }
 
+/**
+ * Parse an scp-style SSH Git URL (`user@host:path` or `user@host:port/path`).
+ *
+ * @return array{user: string, host: string, port: ?string, path: string}|null
+ */
+function parseScpStyleGitUrl(?string $gitRepository): ?array
+{
+    if (! is_string($gitRepository) || $gitRepository === '') {
+        return null;
+    }
+
+    if (preg_match('/^(?<user>[A-Za-z0-9._-]+)@(?<host>[^:]+):(?:(?<port>\d+)\/)?(?<path>.+)$/', $gitRepository, $matches) !== 1) {
+        return null;
+    }
+
+    $host = trim($matches['host']);
+    $path = ltrim($matches['path'], '/');
+
+    if ($host === '' || $path === '') {
+        return null;
+    }
+
+    return [
+        'user' => $matches['user'],
+        'host' => $host,
+        'port' => ($matches['port'] ?? '') === '' ? null : $matches['port'],
+        'path' => $path,
+    ];
+}
+
+function scpStyleGitUrlToHttps(?string $gitRepository): ?string
+{
+    $parts = parseScpStyleGitUrl($gitRepository);
+
+    if ($parts === null) {
+        return null;
+    }
+
+    return 'https://'.$parts['host'].'/'.$parts['path'];
+}
+
+function gitRepositorySlug(?string $gitRepository): string
+{
+    if (! is_string($gitRepository) || $gitRepository === '') {
+        return '';
+    }
+
+    if (($scp = parseScpStyleGitUrl($gitRepository)) !== null) {
+        $gitRepository = $scp['path'];
+    } elseif (str($gitRepository)->startsWith('http') || str($gitRepository)->contains('github.com')) {
+        $gitRepository = str($gitRepository)->replace('https://', '')->replace('http://', '')->replace('github.com/', '');
+    }
+
+    return str($gitRepository)->trim('/')->replaceEnd('.git', '')->toString();
+}
+
 function convertGitUrl(string $gitRepository, string $deploymentType, GithubApp|GitlabApp|null $source = null): array
 {
     $repository = $gitRepository;
@@ -3906,7 +4440,6 @@ function convertGitUrl(string $gitRepository, string $deploymentType, GithubApp|
         'repository' => $gitRepository,
     ];
     $sshMatches = [];
-    $matches = [];
 
     // Let's try and parse the string to detect if it's a valid SSH string or not
     preg_match('/((.*?)\:\/\/)?(.*@.*:.*)/', $gitRepository, $sshMatches);
@@ -3941,11 +4474,11 @@ function convertGitUrl(string $gitRepository, string $deploymentType, GithubApp|
             $providerInfo['port'] = (string) $parsedRepository['port'];
         }
     } else {
-        preg_match('/^(?<host>[^:]+):(?<port>\d+)\/(?<path>.+)$/', $normalizedRepository, $matches);
+        $scp = parseScpStyleGitUrl($normalizedRepository);
 
-        if (! empty($matches['port'])) {
-            $providerInfo['port'] = $matches['port'];
-            $repository = "{$matches['host']}:{$matches['path']}";
+        if ($scp !== null && $scp['port'] !== null) {
+            $providerInfo['port'] = $scp['port'];
+            $repository = "{$scp['user']}@{$scp['host']}:{$scp['path']}";
         }
     }
 
@@ -4352,6 +4885,23 @@ function downsampleLTTB(array $data, int $threshold): array
     $sampled[] = $data[$dataLength - 1]; // Always keep last point
 
     return $sampled;
+}
+
+/**
+ * Convert Sentinel container memory samples from bytes to megabytes.
+ *
+ * Sentinel stores container `used` memory in bytes. Application and database
+ * metric charts label the series as megabytes, so the values must be converted
+ * before they are sent to the frontend.
+ *
+ * @param  array<int, array{0: int|float, 1: int|float}>  $metrics
+ * @return array<int, array{0: int, 1: float}>
+ */
+function convertContainerMemoryBytesToMegabytes(array $metrics): array
+{
+    return array_map(static function (array $point): array {
+        return [(int) $point[0], round(((float) $point[1]) / 1024 / 1024, 2)];
+    }, $metrics);
 }
 
 /**

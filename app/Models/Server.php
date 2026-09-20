@@ -8,6 +8,7 @@ use App\Actions\Server\InstallPrerequisites;
 use App\Actions\Server\StartSentinel;
 use App\Actions\Server\ValidatePrerequisites;
 use App\Enums\ProxyTypes;
+use App\Enums\ServerRole;
 use App\Events\ServerReachabilityChanged;
 use App\Helpers\SslHelper;
 use App\Jobs\CheckAndStartSentinelJob;
@@ -262,8 +263,8 @@ class Server extends BaseModel
         'delete_unused_volumes' => 'boolean',
         'delete_unused_networks' => 'boolean',
         'unreachable_notification_sent' => 'boolean',
-        'is_build_server' => 'boolean',
         'force_disabled' => 'boolean',
+        'sentinel_waiting_since' => 'datetime',
     ];
 
     /**
@@ -521,17 +522,24 @@ class Server extends BaseModel
 
     private static function usableByBuildServerStatus(bool $isBuildServer): Builder
     {
-        return Server::ownedByCurrentTeam()
+        $query = Server::ownedByCurrentTeam()
             ->whereRelation('settings', 'is_reachable', true)
             ->whereRelation('settings', 'is_usable', true)
             ->whereRelation('settings', 'is_swarm_worker', false)
-            ->whereRelation('settings', 'is_build_server', $isBuildServer)
             ->whereRelation('settings', 'force_disabled', false);
+
+        return $isBuildServer
+            ? $query->whereHas('settings', fn (Builder $settings) => $settings
+                ->where('server_role', '!=', ServerRole::DEPLOYMENT->value)
+                ->orWhereNull('server_role'))
+            : $query->whereHas('settings', fn (Builder $settings) => $settings
+                ->where('server_role', '!=', ServerRole::BUILD->value)
+                ->orWhereNull('server_role'));
     }
 
     public function canHostResources(): bool
     {
-        return ! $this->isBuildServer();
+        return $this->settings->effectiveServerRole()->canDeploy();
     }
 
     public function settings()
@@ -546,7 +554,7 @@ class Server extends BaseModel
 
     public function proxySet()
     {
-        return $this->proxyType() && $this->proxyType() !== 'NONE' && $this->isFunctional() && ! $this->isSwarmWorker() && ! $this->settings->is_build_server;
+        return $this->proxyType() && $this->proxyType() !== 'NONE' && $this->isFunctional() && ! $this->isSwarmWorker() && $this->canHostResources();
     }
 
     public function setupDefaultRedirect()
@@ -731,11 +739,12 @@ class Server extends BaseModel
                 ];
 
                 if ($schema === 'https') {
-                    $traefik_dynamic_conf['http']['routers']['coolify-http']['middlewares'] = [
-                        0 => 'redirect-to-https',
-                    ];
+                    $traefik_dynamic_conf['http']['routers']['coolify-http']['middlewares'] = $this->dashboardHttpMiddlewares($settings);
 
                     $traefik_dynamic_conf['http']['routers']['coolify-https'] = [
+                        'middlewares' => [
+                            0 => 'gzip',
+                        ],
                         'entryPoints' => [
                             0 => 'https',
                         ],
@@ -789,8 +798,10 @@ class Server extends BaseModel
                 $url = Url::fromString($settings->fqdn);
                 $host = $url->getHost();
                 $schema = $url->getScheme();
+                $siteAddress = $this->dashboardCaddySiteAddress($settings, $schema, $host);
                 $caddy_file = "
-$schema://$host {
+$siteAddress {
+    encode zstd gzip
     handle /app/* {
         reverse_proxy coolify-realtime:6001
     }
@@ -815,6 +826,24 @@ $schema://$host {
         ], $this);
     }
 
+    public function dashboardHttpMiddlewares(InstanceSettings $settings): array
+    {
+        if ($settings->is_dashboard_force_https_enabled) {
+            return ['redirect-to-https'];
+        }
+
+        return ['gzip'];
+    }
+
+    public function dashboardCaddySiteAddress(InstanceSettings $settings, string $schema, string $host): string
+    {
+        if ($schema === 'https' && ! $settings->is_dashboard_force_https_enabled) {
+            return "http://{$host}, https://{$host}";
+        }
+
+        return "{$schema}://{$host}";
+    }
+
     public function proxyPath()
     {
         $base_path = config('constants.coolify.base_config_path');
@@ -837,6 +866,33 @@ $schema://$host {
         return data_get($this->proxy, 'type');
     }
 
+    public function hasPendingProxyConfiguration(): bool
+    {
+        if ($this->proxy->get('status') !== 'running') {
+            return false;
+        }
+
+        $savedSettings = $this->proxy->get('last_saved_settings');
+        $appliedSettings = $this->proxy->get('last_applied_settings');
+
+        return filled($savedSettings) && filled($appliedSettings) && $savedSettings !== $appliedSettings;
+    }
+
+    public function hasCurrentTraefikOutdatedInfo(): bool
+    {
+        if ($this->proxyType() !== ProxyTypes::TRAEFIK->value) {
+            return false;
+        }
+
+        $detectedVersion = ltrim((string) $this->detected_traefik_version, 'v');
+        $storedVersion = ltrim((string) data_get($this->traefik_outdated_info, 'current'), 'v');
+        $type = data_get($this->traefik_outdated_info, 'type');
+
+        return filled($detectedVersion)
+            && $storedVersion === $detectedVersion
+            && in_array($type, ['patch_update', 'minor_upgrade'], true);
+    }
+
     public function scopeWithProxy(): Builder
     {
         return $this->proxy->modelScope();
@@ -854,7 +910,14 @@ $schema://$host {
 
     public static function buildServers($teamId)
     {
-        return Server::whereTeamId($teamId)->whereRelation('settings', 'is_reachable', true)->whereRelation('settings', 'is_build_server', true);
+        return Server::whereTeamId($teamId)
+            ->whereRelation('settings', 'is_reachable', true)
+            ->whereRelation('settings', 'is_usable', true)
+            ->whereRelation('settings', 'is_swarm_worker', false)
+            ->whereHas('settings', fn (Builder $settings) => $settings
+                ->where('server_role', '!=', ServerRole::DEPLOYMENT->value)
+                ->orWhereNull('server_role'))
+            ->whereRelation('settings', 'force_disabled', false);
     }
 
     public function isForceDisabled()
@@ -862,8 +925,29 @@ $schema://$host {
         return $this->settings->force_disabled;
     }
 
+    /**
+     * Server was migrated away from this Coolify instance (source side).
+     * Must not be revalidated or re-enabled as a live managed host.
+     */
+    public function isTransferredAway(): bool
+    {
+        return data_get($this->server_metadata, 'transfer.status') === 'transferred';
+    }
+
+    /**
+     * Whether this server may be validated / installed against from this instance.
+     */
+    public function canBeValidated(): bool
+    {
+        return ! $this->isTransferredAway();
+    }
+
     public function forceEnableServer()
     {
+        if ($this->isTransferredAway()) {
+            return;
+        }
+
         $this->settings->force_disabled = false;
         $this->settings->save();
     }
@@ -898,22 +982,41 @@ $schema://$host {
         return $wait;
     }
 
+    public function firstSentinelReportTimeoutSeconds(): int
+    {
+        return max(30, $this->settings->sentinel_push_interval_seconds + 30);
+    }
+
     public function isSentinelLive()
     {
         return Carbon::parse($this->sentinel_updated_at)->isAfter(now()->subSeconds($this->waitBeforeDoingSshCheck()));
     }
 
-    public function isSentinelEnabled()
+    public function sentinelStatus(): string
     {
-        return ($this->isMetricsEnabled() || $this->isServerApiEnabled()) && ! $this->isBuildServer();
+        if ($this->sentinel_waiting_since !== null) {
+            return $this->sentinel_waiting_since->isAfter(now()->subSeconds($this->firstSentinelReportTimeoutSeconds()))
+                ? 'waiting'
+                : 'out_of_sync';
+        }
+
+        return $this->isSentinelLive() ? 'in_sync' : 'out_of_sync';
     }
 
-    public function isMetricsEnabled()
+    public function isSentinelEnabled(): bool
+    {
+        return ! $this->isBuildServer()
+            && ! $this->isSwarm()
+            && ! $this->isForceDisabled()
+            && ! $this->isTransferredAway();
+    }
+
+    public function isMetricsEnabled(): bool
     {
         return $this->settings->is_metrics_enabled;
     }
 
-    public function isServerApiEnabled()
+    public function isServerApiEnabled(): bool
     {
         return $this->settings->is_sentinel_enabled;
     }
@@ -940,7 +1043,7 @@ $schema://$host {
 
     public function stopUnmanaged($id)
     {
-        return instant_remote_process(['docker stop -t 0 '.escapeshellarg($id)], $this);
+        return instant_remote_process([dockerStopCommand(0, escapeshellarg($id), $this)], $this);
     }
 
     public function restartUnmanaged($id)
@@ -1330,7 +1433,7 @@ $schema://$host {
 
         try {
             $output = instant_remote_process([
-                'echo "---PRETTY_NAME---" && grep PRETTY_NAME /etc/os-release | cut -d= -f2 | tr -d \'"\' && echo "---ARCH---" && uname -m && echo "---KERNEL---" && uname -r && echo "---CPUS---" && nproc && echo "---MEMORY---" && free -b | awk \'/Mem:/{print $2}\' && echo "---UPTIME_SINCE---" && uptime -s',
+                'echo "---PRETTY_NAME---" && grep PRETTY_NAME /etc/os-release | cut -d= -f2 | tr -d \'"\' && echo "---ARCH---" && uname -m && echo "---KERNEL---" && uname -r && echo "---CPUS---" && nproc && echo "---MEMORY---" && free -b | awk \'/Mem:/{print $2}\' && echo "---UPTIME_SINCE---" && uptime -s && echo "---DOCKER---" && (docker version --format \'{{.Server.Version}}\' 2>/dev/null || true) && echo "---COMPOSE---" && (docker compose version --short 2>/dev/null || true)',
             ], $this, false);
 
             if (! $output) {
@@ -1359,6 +1462,23 @@ $schema://$host {
             ];
 
             $this->update(['server_metadata' => $metadata]);
+
+            try {
+                $detectedDockerVersion = parseDockerEngineVersion($sections['DOCKER'] ?? null);
+                if ($detectedDockerVersion !== null) {
+                    $this->rememberDockerVersion($detectedDockerVersion);
+                }
+
+                $detectedComposeVersion = parseDockerEngineVersion($sections['COMPOSE'] ?? null);
+                if ($detectedComposeVersion !== null) {
+                    $this->rememberComposeVersion($detectedComposeVersion);
+                }
+            } catch (\Throwable $e) {
+                Log::debug('Failed to store server runtime versions', [
+                    'server_id' => $this->id,
+                    'error' => $e->getMessage(),
+                ]);
+            }
 
             return $metadata;
         } catch (\Throwable $e) {
@@ -1544,7 +1664,7 @@ $schema://$host {
         }
         $this->settings->is_usable = true;
         $this->settings->save();
-        $this->validateCoolifyNetwork(isSwarm: false, isBuildServer: $this->settings->is_build_server);
+        $this->validateCoolifyNetwork(isSwarm: false, isBuildServer: $this->isBuildServer());
 
         return true;
     }
@@ -1583,11 +1703,40 @@ $schema://$host {
         return true;
     }
 
+    public function dockerVersion(): ?string
+    {
+        return $this->settings?->docker_version;
+    }
+
+    public function rememberDockerVersion(?string $version): void
+    {
+        $this->settings->update([
+            'docker_version' => parseDockerEngineVersion($version),
+            'docker_version_checked_at' => now(),
+        ]);
+    }
+
+    public function composeVersion(): ?string
+    {
+        return $this->settings?->compose_version;
+    }
+
+    public function rememberComposeVersion(?string $version): void
+    {
+        $this->settings->update([
+            'compose_version' => parseDockerEngineVersion($version),
+            'compose_version_checked_at' => now(),
+        ]);
+    }
+
     public function validateDockerEngineVersion()
     {
         $dockerVersionRaw = instant_remote_process(['docker version --format json'], $this, false);
         $dockerVersionJson = json_decode($dockerVersionRaw, true);
         $dockerVersion = data_get($dockerVersionJson, 'Server.Version', '0.0.0');
+        $this->rememberDockerVersion(is_string($dockerVersion) ? $dockerVersion : null);
+        $composeVersionRaw = instant_remote_process(['docker compose version --short'], $this, false);
+        $this->rememberComposeVersion(is_string($composeVersionRaw) ? $composeVersionRaw : null);
         $dockerVersion = checkMinimumDockerEngineVersion($dockerVersion);
         if (is_null($dockerVersion)) {
             $this->settings->is_usable = false;
@@ -1626,7 +1775,12 @@ $schema://$host {
 
     public function isBuildServer()
     {
-        return $this->settings->is_build_server;
+        return $this->settings->effectiveServerRole() === ServerRole::BUILD;
+    }
+
+    public function canBuildApplications(): bool
+    {
+        return $this->settings->effectiveServerRole()->canBuild();
     }
 
     public static function createWithPrivateKey(array $data, PrivateKey $privateKey)
@@ -1697,6 +1851,8 @@ $schema://$host {
             $this->proxy->set('last_saved_proxy_configuration', null);
             $this->proxy->set('last_saved_settings', null);
             $this->proxy->set('last_applied_settings', null);
+            $this->detected_traefik_version = null;
+            $this->traefik_outdated_info = null;
             $this->save();
             if ($this->proxySet()) {
                 if ($async) {

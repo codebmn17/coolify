@@ -9,6 +9,7 @@ use App\Actions\Service\UpdateServiceApplicationFromApi;
 use App\Http\Controllers\Controller;
 use App\Models\Service;
 use App\Models\ServiceApplication;
+use App\Support\ValidationPatterns;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Collection;
@@ -242,6 +243,13 @@ class ServiceApplicationsController extends Controller
                             nullable: true,
                             description: 'Comma-separated list of URLs (e.g. "http://app.example.com:8080,https://app2.example.com"). Stored as fqdn.'
                         ),
+                        'noindex_domains' => new OA\Property(
+                            property: 'noindex_domains',
+                            type: 'array',
+                            items: new OA\Items(type: 'string'),
+                            description: 'The subset of the service application domains served with an X-Robots-Tag: noindex, nofollow response header, keeping them out of search engines. Entries that are not among the domains are ignored.',
+                            nullable: true,
+                        ),
                         'human_name' => new OA\Property(property: 'human_name', type: 'string', nullable: true),
                         'description' => new OA\Property(property: 'description', type: 'string', nullable: true),
                         'image' => new OA\Property(property: 'image', type: 'string', nullable: true),
@@ -249,6 +257,8 @@ class ServiceApplicationsController extends Controller
                         'is_log_drain_enabled' => new OA\Property(property: 'is_log_drain_enabled', type: 'boolean', nullable: true),
                         'is_gzip_enabled' => new OA\Property(property: 'is_gzip_enabled', type: 'boolean', nullable: true),
                         'is_stripprefix_enabled' => new OA\Property(property: 'is_stripprefix_enabled', type: 'boolean', nullable: true),
+                        'is_force_https_enabled' => new OA\Property(property: 'is_force_https_enabled', type: 'boolean', nullable: true),
+                        'max_restart_count' => new OA\Property(property: 'max_restart_count', type: 'integer', minimum: 0, nullable: true, description: 'Maximum Docker restart count before Coolify stops the container. Set to 0 to disable the limit.'),
                     ]
                 )
             )
@@ -313,6 +323,7 @@ class ServiceApplicationsController extends Controller
 
         $allowedFields = [
             'url',
+            'noindex_domains',
             'human_name',
             'description',
             'image',
@@ -320,10 +331,14 @@ class ServiceApplicationsController extends Controller
             'is_log_drain_enabled',
             'is_gzip_enabled',
             'is_stripprefix_enabled',
+            'is_force_https_enabled',
+            'max_restart_count',
         ];
 
         $validationRules = [
-            'url' => 'nullable|string',
+            'url' => ValidationPatterns::applicationDomainRules(),
+            'noindex_domains' => 'sometimes|array|nullable',
+            'noindex_domains.*' => 'string',
             'human_name' => 'nullable|string|max:255',
             'description' => 'nullable|string',
             'image' => 'nullable|string',
@@ -331,6 +346,8 @@ class ServiceApplicationsController extends Controller
             'is_log_drain_enabled' => 'sometimes|boolean',
             'is_gzip_enabled' => 'sometimes|boolean',
             'is_stripprefix_enabled' => 'sometimes|boolean',
+            'is_force_https_enabled' => 'sometimes|boolean',
+            'max_restart_count' => 'sometimes|integer|min:0',
         ];
 
         $validator = Validator::make($payload, $validationRules);
@@ -385,9 +402,12 @@ class ServiceApplicationsController extends Controller
             new OA\Parameter(
                 name: 'lines',
                 in: 'query',
-                description: 'Number of lines to show from the end of the logs.',
+                description: 'Number of lines to show from the end of the logs. Use `all` to return all logs. `-1` remains available as a compatibility alias.',
                 required: false,
-                schema: new OA\Schema(type: 'integer', format: 'int32', default: 100)
+                schema: new OA\Schema(oneOf: [
+                    new OA\Schema(type: 'integer', format: 'int32', default: 100, minimum: -1, maximum: 10000),
+                    new OA\Schema(type: 'string', enum: ['all']),
+                ])
             ),
         ],
         responses: [
@@ -434,7 +454,16 @@ class ServiceApplicationsController extends Controller
         parameters: [
             new OA\Parameter(name: 'uuid', in: 'path', required: true, schema: new OA\Schema(type: 'string')),
             new OA\Parameter(name: 'app_uuid', in: 'path', required: true, schema: new OA\Schema(type: 'string')),
-            new OA\Parameter(name: 'lines', in: 'query', required: false, schema: new OA\Schema(type: 'integer', format: 'int32', default: 100)),
+            new OA\Parameter(
+                name: 'lines',
+                in: 'query',
+                description: 'Number of lines to show from the end of the logs. Use `all` to return all logs. `-1` remains available as a compatibility alias.',
+                required: false,
+                schema: new OA\Schema(oneOf: [
+                    new OA\Schema(type: 'integer', format: 'int32', default: 100, minimum: -1, maximum: 10000),
+                    new OA\Schema(type: 'string', enum: ['all']),
+                ]),
+            ),
         ],
         responses: [
             new OA\Response(

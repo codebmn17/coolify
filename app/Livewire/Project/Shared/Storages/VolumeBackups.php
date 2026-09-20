@@ -8,6 +8,7 @@ use App\Models\LocalFileVolume;
 use App\Models\LocalPersistentVolume;
 use App\Models\S3Storage;
 use App\Models\ScheduledVolumeBackup;
+use App\Models\Service;
 use Illuminate\Foundation\Auth\Access\AuthorizesRequests;
 use Illuminate\Http\RedirectResponse;
 use Illuminate\Routing\Redirector;
@@ -55,9 +56,22 @@ class VolumeBackups extends Component
 
     public string $timezone = '';
 
-    public int $timeout = 3600;
+    public int $timeout = ScheduledVolumeBackup::DEFAULT_TIMEOUT;
+
+    public int $perPage = 10;
+
+    public function updatedPerPage(): void
+    {
+        $this->perPage = max(1, min(100, $this->perPage));
+
+        $this->resetPage();
+    }
 
     public bool $delete_backup_s3 = false;
+
+    public bool $delete_associated_backups_locally = false;
+
+    public bool $delete_associated_backups_s3 = false;
 
     public Collection $availableS3Storages;
 
@@ -137,7 +151,11 @@ class VolumeBackups extends Component
         }
 
         $this->resetErrorBag('s3StorageId');
-        $this->backup?->update(['s3_storage_id' => $this->s3StorageId]);
+        if (! $this->validateSettings()) {
+            return;
+        }
+
+        $this->backup = $this->persistBackup($this->enabled);
         $this->dispatch('success', 'S3 storage updated.');
     }
 
@@ -153,11 +171,11 @@ class VolumeBackups extends Component
 
         $this->saveToS3 = ! $this->saveToS3;
         $this->disableLocalBackup = $this->saveToS3 && $this->disableLocalBackup;
-        $this->backup?->update([
-            'save_s3' => $this->saveToS3,
-            'disable_local_backup' => $this->disableLocalBackup,
-            's3_storage_id' => $this->s3StorageId,
-        ]);
+        if (! $this->validateSettings()) {
+            return;
+        }
+
+        $this->backup = $this->persistBackup($this->enabled);
         $this->dispatch('success', $this->saveToS3 ? 'S3 backups enabled.' : 'S3 backups disabled.');
     }
 
@@ -196,12 +214,7 @@ class VolumeBackups extends Component
         VolumeBackupJob::dispatch($this->backup);
         $this->dispatch('success', 'Storage backup queued.');
 
-        return redirect()->route('project.application.backup.executions', [
-            'project_uuid' => $this->resource->project()->uuid,
-            'environment_uuid' => $this->resource->environment->uuid,
-            'application_uuid' => $this->resource->uuid,
-            'backup_uuid' => $this->backup->uuid,
-        ]);
+        return redirect()->route($this->routeName('executions'), $this->routeParameters());
     }
 
     public function delete(?string $password = null, array $selectedActions = []): bool|string
@@ -217,18 +230,18 @@ class VolumeBackups extends Component
         }
 
         try {
-            DeleteScheduledVolumeBackup::run($this->backup);
+            DeleteScheduledVolumeBackup::run(
+                $this->backup,
+                deleteLocalArchives: in_array('delete_associated_backups_locally', $selectedActions, true),
+                deleteS3Archives: in_array('delete_associated_backups_s3', $selectedActions, true),
+            );
             $this->backup = null;
-            $this->dispatch('success', 'Storage backup schedule and archives deleted.');
-            $this->redirectRoute('project.application.backup.index', [
-                'project_uuid' => $this->resource->project()->uuid,
-                'environment_uuid' => $this->resource->environment->uuid,
-                'application_uuid' => $this->resource->uuid,
-            ], navigate: true);
+            $this->dispatch('success', 'Storage backup schedule deleted.');
+            $this->redirectRoute($this->routeName('index'), $this->routeParameters(includeBackup: false), navigate: true);
 
             return true;
         } catch (Throwable $exception) {
-            $this->dispatch('error', 'Could not delete the backup archives: '.$exception->getMessage());
+            $this->dispatch('error', 'Could not delete the backup schedule: '.$exception->getMessage());
 
             return false;
         }
@@ -324,11 +337,15 @@ class VolumeBackups extends Component
 
     public function render()
     {
-        $executions = $this->backup?->executions()->paginate(10);
+        $executions = $this->backup?->executions()->paginate($this->perPage);
 
         return view('livewire.project.shared.storages.volume-backups', [
             'executions' => $executions ?? collect(),
             'latestExecution' => $this->backup?->executions()->first(),
+            'deleteScheduleCheckboxes' => [
+                ['id' => 'delete_associated_backups_locally', 'label' => 'Delete all local archives created by this schedule.'],
+                ['id' => 'delete_associated_backups_s3', 'label' => 'Delete all S3 archives created by this schedule.'],
+            ],
         ]);
     }
 
@@ -384,5 +401,26 @@ class VolumeBackups extends Component
                 ->where('team_id', currentTeam()->id)
                 ->where('is_usable', true)
                 ->exists();
+    }
+
+    private function routeName(string $section): string
+    {
+        return $this->resource instanceof Service
+            ? "project.service.volume-backups.{$section}"
+            : "project.application.backup.{$section}";
+    }
+
+    private function routeParameters(bool $includeBackup = true): array
+    {
+        $parameters = [
+            'project_uuid' => $this->resource->project()->uuid,
+            'environment_uuid' => $this->resource->environment->uuid,
+        ];
+        $parameters[$this->resource instanceof Service ? 'service_uuid' : 'application_uuid'] = $this->resource->uuid;
+        if ($includeBackup) {
+            $parameters['backup_uuid'] = $this->backup?->uuid;
+        }
+
+        return $parameters;
     }
 }

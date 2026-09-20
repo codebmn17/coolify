@@ -11,6 +11,7 @@ use App\Enums\NewDatabaseTypes;
 use App\Http\Controllers\Controller;
 use App\Jobs\DatabaseBackupJob;
 use App\Jobs\DeleteResourceJob;
+use App\Jobs\VolumeCloneJob;
 use App\Models\EnvironmentVariable;
 use App\Models\LocalFileVolume;
 use App\Models\LocalPersistentVolume;
@@ -18,11 +19,14 @@ use App\Models\Project;
 use App\Models\S3Storage;
 use App\Models\ScheduledDatabaseBackup;
 use App\Models\Server;
+use App\Models\StandaloneDocker;
 use App\Models\StandalonePostgresql;
+use App\Models\SwarmDocker;
 use App\Support\ValidationPatterns;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Bus;
 use Illuminate\Support\Facades\DB;
 use OpenApi\Attributes as OA;
 
@@ -765,6 +769,7 @@ class DatabasesController extends Controller
                         'database_backup_retention_days_s3' => ['type' => 'integer', 'description' => 'Number of days to retain backups in S3'],
                         'database_backup_retention_max_storage_s3' => ['type' => 'number', 'description' => 'Max storage (GB) for S3 backups'],
                         'timeout' => ['type' => 'integer', 'description' => 'Backup job timeout in seconds (min: 60, max: 36000)', 'default' => 3600],
+                        'missing_backup_notification_days' => ['type' => 'integer', 'description' => 'Alert after this many days without an execution; 0 disables alerts', 'minimum' => 0, 'maximum' => 365, 'default' => 0],
                     ],
                 ),
             )
@@ -801,7 +806,7 @@ class DatabasesController extends Controller
     )]
     public function create_backup(Request $request)
     {
-        $backupConfigFields = ['save_s3', 'enabled', 'dump_all', 'frequency', 'databases_to_backup', 'database_backup_retention_amount_locally', 'database_backup_retention_days_locally', 'database_backup_retention_max_storage_locally', 'database_backup_retention_amount_s3', 'database_backup_retention_days_s3', 'database_backup_retention_max_storage_s3', 's3_storage_uuid', 'timeout'];
+        $backupConfigFields = ['save_s3', 'enabled', 'dump_all', 'frequency', 'databases_to_backup', 'database_backup_retention_amount_locally', 'database_backup_retention_days_locally', 'database_backup_retention_max_storage_locally', 'database_backup_retention_amount_s3', 'database_backup_retention_days_s3', 'database_backup_retention_max_storage_s3', 's3_storage_uuid', 'timeout', 'missing_backup_notification_days'];
 
         $teamId = getTeamIdFromToken();
         if (is_null($teamId)) {
@@ -829,6 +834,7 @@ class DatabasesController extends Controller
             'database_backup_retention_days_s3' => 'integer|min:0',
             'database_backup_retention_max_storage_s3' => 'numeric|min:0',
             'timeout' => 'integer|min:60|max:36000',
+            'missing_backup_notification_days' => 'integer|min:0|max:365',
         ]);
 
         if ($validator->fails()) {
@@ -1021,6 +1027,7 @@ class DatabasesController extends Controller
                         'database_backup_retention_days_s3' => ['type' => 'integer', 'description' => 'Retention days of the backup in s3'],
                         'database_backup_retention_max_storage_s3' => ['type' => 'number', 'description' => 'Max storage of the backup in S3'],
                         'timeout' => ['type' => 'integer', 'description' => 'Backup job timeout in seconds (min: 60, max: 36000)', 'default' => 3600],
+                        'missing_backup_notification_days' => ['type' => 'integer', 'description' => 'Alert after this many days without an execution; 0 disables alerts', 'minimum' => 0, 'maximum' => 365],
                     ],
                 ),
             )
@@ -1050,7 +1057,7 @@ class DatabasesController extends Controller
     )]
     public function update_backup(Request $request)
     {
-        $backupConfigFields = ['save_s3', 'enabled', 'dump_all', 'frequency', 'databases_to_backup', 'database_backup_retention_amount_locally', 'database_backup_retention_days_locally', 'database_backup_retention_max_storage_locally', 'database_backup_retention_amount_s3', 'database_backup_retention_days_s3', 'database_backup_retention_max_storage_s3', 's3_storage_uuid', 'timeout'];
+        $backupConfigFields = ['save_s3', 'enabled', 'dump_all', 'frequency', 'databases_to_backup', 'database_backup_retention_amount_locally', 'database_backup_retention_days_locally', 'database_backup_retention_max_storage_locally', 'database_backup_retention_amount_s3', 'database_backup_retention_days_s3', 'database_backup_retention_max_storage_s3', 's3_storage_uuid', 'timeout', 'missing_backup_notification_days'];
 
         $teamId = getTeamIdFromToken();
         if (is_null($teamId)) {
@@ -1076,6 +1083,7 @@ class DatabasesController extends Controller
             'database_backup_retention_days_s3' => 'integer|min:0',
             'database_backup_retention_max_storage_s3' => 'numeric|min:0',
             'timeout' => 'integer|min:60|max:36000',
+            'missing_backup_notification_days' => 'integer|min:0|max:365',
         ]);
         if ($validator->fails()) {
             return response()->json([
@@ -2425,13 +2433,12 @@ class DatabasesController extends Controller
             new OA\Parameter(
                 name: 'lines',
                 in: 'query',
-                description: 'Number of lines to show from the end of the logs.',
+                description: 'Number of lines to show from the end of the logs. Use `all` to return all logs. `-1` remains available as a compatibility alias.',
                 required: false,
-                schema: new OA\Schema(
-                    type: 'integer',
-                    format: 'int32',
-                    default: 100,
-                )
+                schema: new OA\Schema(oneOf: [
+                    new OA\Schema(type: 'integer', format: 'int32', default: 100, minimum: -1, maximum: 10000),
+                    new OA\Schema(type: 'string', enum: ['all']),
+                ])
             ),
             new OA\Parameter(
                 name: 'show_timestamps',
@@ -2581,6 +2588,8 @@ class DatabasesController extends Controller
         }
 
         $this->authorize('delete', $database);
+
+        $database->delete();
 
         DeleteResourceJob::dispatch(
             resource: $database,
@@ -3048,6 +3057,54 @@ class DatabasesController extends Controller
         $this->authorize('update', $database);
 
         return moveResourceToEnvironment($request, $database, 'Database', $teamId);
+    }
+
+    #[OA\Post(
+        summary: 'Migrate to Server',
+        description: 'Migrate a database to another destination/server owned by the authenticated team. Stops the database, optionally transfers persistent volume data when both servers are managed by Coolify, and updates database records. Redeploy after migration completes.',
+        path: '/databases/{uuid}/migrate',
+        operationId: 'migrate-database-by-uuid',
+        security: [['bearerAuth' => []]],
+        tags: ['Databases'],
+        parameters: [
+            new OA\Parameter(name: 'uuid', in: 'path', required: true, description: 'UUID of the database.', schema: new OA\Schema(type: 'string')),
+        ],
+        requestBody: new OA\RequestBody(
+            required: true,
+            content: new OA\JsonContent(
+                required: ['destination_uuid'],
+                properties: [
+                    new OA\Property(property: 'destination_uuid', type: 'string', description: 'UUID of the target destination.'),
+                    new OA\Property(property: 'migrate_volumes', type: 'boolean', default: true, description: 'Whether to transfer persistent volume data when migrating across servers.'),
+                ]
+            )
+        ),
+        responses: [
+            new OA\Response(response: 200, description: 'Database migration started or completed.'),
+            new OA\Response(response: 400, ref: '#/components/responses/400'),
+            new OA\Response(response: 401, ref: '#/components/responses/401'),
+            new OA\Response(response: 404, ref: '#/components/responses/404'),
+            new OA\Response(response: 422, ref: '#/components/responses/422'),
+        ]
+    )]
+    public function migrate_by_uuid(Request $request): JsonResponse
+    {
+        $teamId = getTeamIdFromToken();
+        if (is_null($teamId)) {
+            return invalidTokenResponse();
+        }
+        $uuid = $request->route('uuid');
+        if (! $uuid) {
+            return response()->json(['message' => 'UUID is required.'], 400);
+        }
+        $database = queryDatabaseByUuidWithinTeam($request->uuid, $teamId);
+        if (! $database) {
+            return response()->json(['message' => 'Database not found.'], 404);
+        }
+
+        $this->authorize('update', $database);
+
+        return migrateResourceToDestination($request, $database, 'Database', $teamId);
     }
 
     #[OA\Post(
@@ -4007,7 +4064,6 @@ class DatabasesController extends Controller
                             'type' => ['type' => 'string', 'enum' => ['persistent', 'file'], 'description' => 'The type of storage.'],
                             'name' => ['type' => 'string', 'description' => 'Volume name (persistent only, required for persistent).'],
                             'mount_path' => ['type' => 'string', 'description' => 'The container mount path.'],
-                            'host_path' => ['type' => 'string', 'nullable' => true, 'description' => 'The host path (persistent only, optional).'],
                             'content' => ['type' => 'string', 'nullable' => true, 'description' => 'File content (file only, optional).'],
                             'is_directory' => ['type' => 'boolean', 'description' => 'Whether this is a directory mount (file only, default false).'],
                             'fs_path' => ['type' => 'string', 'description' => 'Host directory path (required when is_directory is true).'],
@@ -4052,14 +4108,13 @@ class DatabasesController extends Controller
             'type' => 'required|string|in:persistent,file',
             'name' => ['string', 'regex:'.ValidationPatterns::VOLUME_NAME_PATTERN],
             'mount_path' => 'required|string',
-            'host_path' => ['string', 'nullable', 'regex:'.ValidationPatterns::DIRECTORY_PATH_PATTERN],
             'content' => 'string|nullable',
             'is_directory' => 'boolean',
             'is_host_file' => 'boolean',
             'fs_path' => 'string',
         ]);
 
-        $allAllowedFields = ['type', 'name', 'mount_path', 'host_path', 'content', 'is_directory', 'is_host_file', 'fs_path'];
+        $allAllowedFields = ['type', 'name', 'mount_path', 'content', 'is_directory', 'is_host_file', 'fs_path'];
         $extraFields = array_diff(array_keys($request->all()), $allAllowedFields);
         if ($validator->fails() || ! empty($extraFields)) {
             $errors = $validator->errors();
@@ -4095,7 +4150,6 @@ class DatabasesController extends Controller
             $storage = LocalPersistentVolume::create([
                 'name' => $database->uuid.'-'.$request->name,
                 'mount_path' => $request->mount_path,
-                'host_path' => $request->host_path,
                 'resource_id' => $database->id,
                 'resource_type' => $database->getMorphClass(),
             ]);
@@ -4247,7 +4301,6 @@ class DatabasesController extends Controller
                             'is_preview_suffix_enabled' => ['type' => 'boolean', 'description' => 'Whether to add -pr-N suffix for preview deployments.'],
                             'name' => ['type' => 'string', 'description' => 'The volume name (persistent only, not allowed for read-only storages).'],
                             'mount_path' => ['type' => 'string', 'description' => 'The container mount path (not allowed for read-only storages).'],
-                            'host_path' => ['type' => 'string', 'nullable' => true, 'description' => 'The host path (persistent only, not allowed for read-only storages).'],
                             'content' => ['type' => 'string', 'nullable' => true, 'description' => 'The file content (file only, not allowed for read-only storages).'],
                         ],
                         additionalProperties: false,
@@ -4306,11 +4359,10 @@ class DatabasesController extends Controller
             'is_preview_suffix_enabled' => 'boolean',
             'name' => ['string', 'regex:'.ValidationPatterns::VOLUME_NAME_PATTERN],
             'mount_path' => 'string',
-            'host_path' => ['string', 'nullable', 'regex:'.ValidationPatterns::DIRECTORY_PATH_PATTERN],
             'content' => 'string|nullable',
         ]);
 
-        $allAllowedFields = ['uuid', 'id', 'type', 'is_preview_suffix_enabled', 'name', 'mount_path', 'host_path', 'content'];
+        $allAllowedFields = ['uuid', 'id', 'type', 'is_preview_suffix_enabled', 'name', 'mount_path', 'content'];
         $extraFields = array_diff(array_keys($request->all()), $allAllowedFields);
         if ($validator->fails() || ! empty($extraFields)) {
             $errors = $validator->errors();
@@ -4352,7 +4404,7 @@ class DatabasesController extends Controller
         }
 
         $isReadOnly = $storage->shouldBeReadOnlyInUI();
-        $editableOnlyFields = ['name', 'mount_path', 'host_path', 'content'];
+        $editableOnlyFields = ['name', 'mount_path', 'content'];
         $requestedEditableFields = array_intersect($editableOnlyFields, array_keys($request->all()));
 
         if ($isReadOnly && ! empty($requestedEditableFields)) {
@@ -4390,9 +4442,6 @@ class DatabasesController extends Controller
                 }
                 if ($request->has('mount_path')) {
                     $storage->mount_path = $request->mount_path;
-                }
-                if ($request->has('host_path')) {
-                    $storage->host_path = $request->host_path;
                 }
             } else {
                 if ($request->has('mount_path')) {
@@ -4647,5 +4696,223 @@ class DatabasesController extends Controller
     public function delete_tag(Request $request): JsonResponse
     {
         return $this->deleteTag($request);
+    }
+
+    #[OA\Post(
+        summary: 'Clone',
+        description: 'Clone a database to a destination owned by the authenticated team.',
+        path: '/databases/{uuid}/clone',
+        operationId: 'clone-database-by-uuid',
+        security: [['bearerAuth' => []]],
+        tags: ['Databases'],
+        parameters: [
+            new OA\Parameter(name: 'uuid', in: 'path', required: true, description: 'UUID of the database.', schema: new OA\Schema(type: 'string')),
+        ],
+        requestBody: new OA\RequestBody(
+            required: true,
+            content: new OA\JsonContent(
+                required: ['destination_uuid'],
+                properties: [
+                    new OA\Property(property: 'destination_uuid', type: 'string'),
+                    new OA\Property(property: 'name', type: 'string', nullable: true),
+                    new OA\Property(property: 'clone_volumes', type: 'boolean', default: false),
+                ]
+            )
+        ),
+        responses: [
+            new OA\Response(response: 201, description: 'Database cloned.'),
+            new OA\Response(response: 400, ref: '#/components/responses/400'),
+            new OA\Response(response: 401, ref: '#/components/responses/401'),
+            new OA\Response(response: 404, ref: '#/components/responses/404'),
+            new OA\Response(response: 422, ref: '#/components/responses/422'),
+        ]
+    )]
+    public function clone_by_uuid(Request $request): JsonResponse
+    {
+        $teamId = getTeamIdFromToken();
+        if (is_null($teamId)) {
+            return invalidTokenResponse();
+        }
+
+        $return = validateIncomingRequest($request);
+        if ($return instanceof JsonResponse) {
+            return $return;
+        }
+
+        $validator = customApiValidator($request->all(), [
+            'destination_uuid' => 'required|string',
+            'name' => 'string|max:255|nullable',
+            'clone_volumes' => 'boolean',
+        ]);
+        $allowedFields = ['destination_uuid', 'name', 'clone_volumes'];
+        $extraFields = array_diff(array_keys($request->all()), $allowedFields);
+        if ($validator->fails() || ! empty($extraFields)) {
+            $errors = $validator->errors();
+            foreach ($extraFields as $field) {
+                $errors->add($field, 'This field is not allowed.');
+            }
+
+            return response()->json([
+                'message' => 'Validation failed.',
+                'errors' => $errors,
+            ], 422);
+        }
+
+        $database = queryDatabaseByUuidWithinTeam($request->route('uuid'), $teamId);
+        if (! $database) {
+            return response()->json(['message' => 'Database not found.'], 404);
+        }
+
+        $this->authorize('update', $database);
+
+        $destination = StandaloneDocker::ownedByCurrentTeamAPI($teamId)->where('uuid', $request->destination_uuid)->first()
+            ?? SwarmDocker::ownedByCurrentTeamAPI($teamId)->where('uuid', $request->destination_uuid)->first();
+
+        if (! $destination || ! $destination->server?->canHostResources()) {
+            return response()->json(['message' => 'Destination not found.'], 404);
+        }
+
+        $uuid = new_public_id();
+        $name = $request->filled('name')
+            ? $request->string('name')->toString()
+            : $database->name.'-clone-'.$uuid;
+        $cloneVolumeData = $request->boolean('clone_volumes', false);
+
+        $newDatabase = $database->replicate([
+            'id',
+            'created_at',
+            'updated_at',
+        ])->fill([
+            'uuid' => $uuid,
+            'name' => $name,
+            'status' => 'exited',
+            'started_at' => null,
+            'destination_id' => $destination->id,
+            'destination_type' => $destination->getMorphClass(),
+        ]);
+        $newDatabase->save();
+
+        foreach ($database->tags as $tag) {
+            $newDatabase->tags()->attach($tag->id);
+        }
+
+        $newDatabase->persistentStorages()->delete();
+        $pendingVolumeClones = [];
+        $sourceServer = $database->destination?->server;
+        $targetServer = $newDatabase->destination?->server;
+
+        foreach ($database->persistentStorages()->get() as $volume) {
+            $originalName = $volume->name;
+            $newName = match (true) {
+                str_starts_with($originalName, 'postgres-data-') => 'postgres-data-'.$newDatabase->uuid,
+                str_starts_with($originalName, 'mysql-data-') => 'mysql-data-'.$newDatabase->uuid,
+                str_starts_with($originalName, 'redis-data-') => 'redis-data-'.$newDatabase->uuid,
+                str_starts_with($originalName, 'clickhouse-data-') => 'clickhouse-data-'.$newDatabase->uuid,
+                str_starts_with($originalName, 'mariadb-data-') => 'mariadb-data-'.$newDatabase->uuid,
+                str_starts_with($originalName, 'mongodb-data-') => 'mongodb-data-'.$newDatabase->uuid,
+                str_starts_with($originalName, 'keydb-data-') => 'keydb-data-'.$newDatabase->uuid,
+                str_starts_with($originalName, 'dragonfly-data-') => 'dragonfly-data-'.$newDatabase->uuid,
+                str_starts_with($volume->name, $database->uuid) => str($volume->name)->replace($database->uuid, $newDatabase->uuid)->toString(),
+                default => $newDatabase->uuid.'-'.$volume->name,
+            };
+
+            $newPersistentVolume = $volume->replicate([
+                'id',
+                'created_at',
+                'updated_at',
+                'uuid',
+            ])->fill([
+                'name' => $newName,
+                'resource_id' => $newDatabase->id,
+            ]);
+            $newPersistentVolume->save();
+
+            if ($cloneVolumeData) {
+                $pendingVolumeClones[] = [
+                    'source' => $volume->name,
+                    'target' => $newPersistentVolume->name,
+                    'model' => $newPersistentVolume,
+                ];
+            }
+        }
+
+        // Stop once, clone all volumes, then start once — avoids per-volume stop/start races.
+        if ($pendingVolumeClones !== [] && $sourceServer && $targetServer) {
+            try {
+                $chain = [
+                    function () use ($database) {
+                        StopDatabase::run($database);
+                    },
+                ];
+
+                foreach ($pendingVolumeClones as $clone) {
+                    $chain[] = new VolumeCloneJob(
+                        $clone['source'],
+                        $clone['target'],
+                        $sourceServer,
+                        $targetServer,
+                        $clone['model'],
+                    );
+                }
+
+                $chain[] = function () use ($database) {
+                    StartDatabase::run($database);
+                };
+
+                Bus::chain($chain)->onQueue('high')->dispatch();
+            } catch (\Exception $e) {
+                \Log::error('Failed to queue database volume clone for '.$database->uuid.': '.$e->getMessage());
+            }
+        }
+
+        foreach ($database->fileStorages()->get() as $storage) {
+            $storage->replicate([
+                'id',
+                'created_at',
+                'updated_at',
+            ])->fill([
+                'resource_id' => $newDatabase->id,
+            ])->save();
+        }
+
+        foreach ($database->scheduledBackups()->get() as $backup) {
+            $backup->replicate([
+                'id',
+                'created_at',
+                'updated_at',
+                'last_execution_at',
+                'missing_backup_notification_sent_at',
+            ])->fill([
+                'uuid' => new_public_id(),
+                'database_id' => $newDatabase->id,
+                'database_type' => $newDatabase->getMorphClass(),
+                'team_id' => $teamId,
+            ])->save();
+        }
+
+        foreach ($database->environment_variables()->get() as $environmentVariable) {
+            $environmentVariable->replicate([
+                'id',
+                'created_at',
+                'updated_at',
+            ])->fill([
+                'resourceable_id' => $newDatabase->id,
+                'resourceable_type' => $newDatabase->getMorphClass(),
+            ])->save();
+        }
+
+        auditLog('api.database.cloned', [
+            'team_id' => $teamId,
+            'source_uuid' => $database->uuid,
+            'database_uuid' => $newDatabase->uuid,
+            'database_name' => $newDatabase->name,
+            'destination_uuid' => $destination->uuid,
+            'clone_volumes' => $cloneVolumeData,
+        ]);
+
+        return response()->json([
+            'uuid' => $newDatabase->uuid,
+            'message' => 'Database cloned.',
+        ], 201);
     }
 }

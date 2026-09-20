@@ -82,16 +82,53 @@ it('creates a service database backup without S3 and opens its configuration', f
 
     $backup = ScheduledDatabaseBackup::query()->sole();
 
-    $component->assertRedirectToRoute('project.service.database.backup.show', [
+    $component->assertRedirectToRoute('project.service.volume-backups.index', [
         'project_uuid' => $this->project->uuid,
         'environment_uuid' => $this->environment->uuid,
         'service_uuid' => $service->uuid,
-        'stack_service_uuid' => $database->uuid,
         'backup_uuid' => $backup->uuid,
     ]);
 
     expect($backup->save_s3)->toBeFalsy()
         ->and($backup->s3_storage_id)->toBeNull();
+});
+
+it('selects a service database when creating a backup from the unified backups page', function () {
+    $service = Service::factory()->create([
+        'server_id' => $this->server->id,
+        'destination_id' => $this->destination->id,
+        'destination_type' => $this->destination->getMorphClass(),
+        'environment_id' => $this->environment->id,
+    ]);
+    ServiceDatabase::create([
+        'service_id' => $service->id,
+        'name' => 'primary',
+        'image' => 'postgres:16-alpine',
+        'custom_type' => 'postgresql',
+    ]);
+    $analytics = ServiceDatabase::create([
+        'service_id' => $service->id,
+        'name' => 'analytics',
+        'image' => 'postgres:16-alpine',
+        'custom_type' => 'postgresql',
+    ]);
+
+    $component = Livewire::test(CreateScheduledBackup::class, ['service' => $service])
+        ->assertSee('Database')
+        ->assertSee('analytics')
+        ->set('selectedDatabaseUuid', $analytics->uuid)
+        ->set('frequency', 'daily')
+        ->call('submit');
+
+    $backup = ScheduledDatabaseBackup::query()->sole();
+    expect($backup->database->is($analytics))->toBeTrue();
+
+    $component->assertRedirectToRoute('project.service.volume-backups.index', [
+        'project_uuid' => $this->project->uuid,
+        'environment_uuid' => $this->environment->uuid,
+        'service_uuid' => $service->uuid,
+        'backup_uuid' => $backup->uuid,
+    ]);
 });
 
 it('creates a clickhouse backup for its configured database', function () {

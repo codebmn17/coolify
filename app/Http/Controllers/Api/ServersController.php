@@ -6,6 +6,7 @@ use App\Actions\Server\DeleteServer;
 use App\Actions\Server\ValidateServer;
 use App\Enums\ProxyStatus;
 use App\Enums\ProxyTypes;
+use App\Enums\ServerRole;
 use App\Http\Controllers\Controller;
 use App\Jobs\DeleteResourceJob;
 use App\Jobs\ValidateAndInstallServerJob;
@@ -439,7 +440,7 @@ class ServersController extends Controller
                         'port' => ['type' => 'integer', 'example' => 22, 'description' => 'The port of the server.'],
                         'user' => ['type' => 'string', 'example' => 'root', 'description' => 'The user of the server.'],
                         'private_key_uuid' => ['type' => 'string', 'example' => 'og888os', 'description' => 'The UUID of the private key.'],
-                        'is_build_server' => ['type' => 'boolean', 'example' => false, 'description' => 'Is build server.'],
+                        'server_role' => ['type' => 'string', 'enum' => ['deployment', 'build', 'both'], 'example' => 'both', 'description' => 'Server role.'],
                         'instant_validate' => ['type' => 'boolean', 'example' => false, 'description' => 'Instant validate.'],
                         'proxy_type' => ['type' => 'string', 'enum' => ['traefik', 'caddy', 'none'], 'example' => 'traefik', 'description' => 'The proxy type.'],
                     ],
@@ -481,7 +482,7 @@ class ServersController extends Controller
     )]
     public function create_server(Request $request)
     {
-        $allowedFields = ['name', 'description', 'ip', 'port', 'user', 'private_key_uuid', 'is_build_server', 'instant_validate', 'proxy_type'];
+        $allowedFields = ['name', 'description', 'ip', 'port', 'user', 'private_key_uuid', 'server_role', 'instant_validate', 'proxy_type'];
 
         $teamId = getTeamIdFromToken();
         if (is_null($teamId)) {
@@ -500,7 +501,7 @@ class ServersController extends Controller
             'port' => 'integer|nullable|between:1,65535',
             'private_key_uuid' => 'string|required',
             'user' => ValidationPatterns::serverUsernameRules(required: false),
-            'is_build_server' => 'boolean|nullable',
+            'server_role' => 'string|nullable|in:deployment,build,both',
             'instant_validate' => 'boolean|nullable',
             'proxy_type' => 'string|nullable',
         ], [
@@ -530,8 +531,15 @@ class ServersController extends Controller
         if (is_null($request->port)) {
             $request->offsetSet('port', 22);
         }
-        if (is_null($request->is_build_server)) {
-            $request->offsetSet('is_build_server', false);
+        $serverRole = $request->filled('server_role')
+            ? ServerRole::from($request->string('server_role')->toString())
+            : ServerRole::BOTH;
+
+        if ($serverRole === ServerRole::DEPLOYMENT && ! ModelsServer::buildServers($teamId)->exists()) {
+            return response()->json([
+                'message' => 'Validation failed.',
+                'errors' => ['server_role' => ['Add another build-capable server before you set this server to deployments only.']],
+            ], 422);
         }
         if (is_null($request->instant_validate)) {
             $request->offsetSet('instant_validate', false);
@@ -550,11 +558,7 @@ class ServersController extends Controller
         }
         $foundServer = ModelsServer::whereIp($request->ip)->first();
         if ($foundServer) {
-            if ($foundServer->team_id === $teamId) {
-                return response()->json(['message' => 'A server with this IP/Domain already exists in your team.'], 400);
-            }
-
-            return response()->json(['message' => 'A server with this IP/Domain is already in use by another team.'], 400);
+            return response()->json(['message' => 'A server with this IP/Domain is already in use.'], 400);
         }
 
         $proxyType = $request->proxy_type ? str($request->proxy_type)->upper() : ProxyTypes::TRAEFIK->value;
@@ -573,7 +577,7 @@ class ServersController extends Controller
         $server->save();
 
         $server->settings()->update([
-            'is_build_server' => $request->is_build_server,
+            'server_role' => $serverRole,
         ]);
         if ($request->instant_validate) {
             ValidateServer::dispatch($server);
@@ -584,7 +588,7 @@ class ServersController extends Controller
             'server_uuid' => $server->uuid,
             'server_name' => $server->name,
             'ip' => $server->ip,
-            'is_build_server' => (bool) $request->is_build_server,
+            'server_role' => $serverRole->value,
         ]);
 
         return response()->json([
@@ -618,7 +622,7 @@ class ServersController extends Controller
                         'port' => ['type' => 'integer', 'description' => 'The port of the server.'],
                         'user' => ['type' => 'string', 'description' => 'The user of the server.'],
                         'private_key_uuid' => ['type' => 'string', 'description' => 'The UUID of the private key.'],
-                        'is_build_server' => ['type' => 'boolean', 'description' => 'Is build server.'],
+                        'server_role' => ['type' => 'string', 'enum' => ['deployment', 'build', 'both'], 'description' => 'Server role.'],
                         'instant_validate' => ['type' => 'boolean', 'description' => 'Instant validate.'],
                         'proxy_type' => ['type' => 'string', 'enum' => ['traefik', 'caddy', 'none'], 'description' => 'The proxy type.'],
                         'concurrent_builds' => ['type' => 'integer', 'description' => 'Number of concurrent builds.'],
@@ -663,7 +667,7 @@ class ServersController extends Controller
     )]
     public function update_server(Request $request)
     {
-        $allowedFields = ['name', 'description', 'ip', 'port', 'user', 'private_key_uuid', 'is_build_server', 'instant_validate', 'proxy_type', 'concurrent_builds', 'dynamic_timeout', 'deployment_queue_limit', 'server_disk_usage_notification_threshold', 'server_disk_usage_check_frequency', 'connection_timeout'];
+        $allowedFields = ['name', 'description', 'ip', 'port', 'user', 'private_key_uuid', 'server_role', 'instant_validate', 'proxy_type', 'concurrent_builds', 'dynamic_timeout', 'deployment_queue_limit', 'server_disk_usage_notification_threshold', 'server_disk_usage_check_frequency', 'connection_timeout', 'is_terminal_enabled'];
 
         $teamId = getTeamIdFromToken();
         if (is_null($teamId)) {
@@ -681,7 +685,7 @@ class ServersController extends Controller
             'port' => 'integer|nullable|between:1,65535',
             'private_key_uuid' => 'string|nullable',
             'user' => ValidationPatterns::serverUsernameRules(required: false),
-            'is_build_server' => 'boolean|nullable',
+            'server_role' => 'string|nullable|in:deployment,build,both',
             'instant_validate' => 'boolean|nullable',
             'proxy_type' => 'string|nullable',
             'concurrent_builds' => 'integer|min:1',
@@ -690,6 +694,7 @@ class ServersController extends Controller
             'server_disk_usage_notification_threshold' => 'integer|min:1|max:100',
             'server_disk_usage_check_frequency' => 'string',
             'connection_timeout' => 'integer|min:1|max:300',
+            'is_terminal_enabled' => 'boolean|nullable',
         ], [
             ...ValidationPatterns::serverUsernameMessages(),
         ]);
@@ -737,17 +742,35 @@ class ServersController extends Controller
             ], 422);
         }
 
-        if ($request->boolean('is_build_server') && ! $server->isBuildServer() && ! $server->isEmpty()) {
+        $serverRole = null;
+        if ($request->filled('server_role')) {
+            $serverRole = ServerRole::from($request->string('server_role')->toString());
+        }
+
+        if ($serverRole === ServerRole::BUILD && ! $server->isBuildServer() && ! $server->isEmpty()) {
             return response()->json([
                 'message' => 'Validation failed.',
-                'errors' => ['is_build_server' => ['A server with existing resources cannot be configured as a build server.']],
+                'errors' => ['server_role' => ['A server with existing resources cannot be configured as build only.']],
+            ], 422);
+        }
+
+        if ($serverRole === ServerRole::DEPLOYMENT && ! ModelsServer::buildServers($teamId)->whereKeyNot($server->id)->exists()) {
+            return response()->json([
+                'message' => 'Validation failed.',
+                'errors' => ['server_role' => ['Add another build-capable server before you set this server to deployments only.']],
             ], 422);
         }
 
         $server->update($updateFields);
-        if ($request->has('is_build_server')) {
+        if ($serverRole !== null) {
             $server->settings()->update([
-                'is_build_server' => $request->boolean('is_build_server'),
+                'server_role' => $serverRole,
+            ]);
+        }
+
+        if ($request->has('is_terminal_enabled')) {
+            $server->settings()->update([
+                'is_terminal_enabled' => $request->boolean('is_terminal_enabled'),
             ]);
         }
 
@@ -851,7 +874,7 @@ class ServersController extends Controller
         if ($server->definedResources()->count() > 0 && ! $force) {
             return response()->json(['message' => 'Server has resources. Use ?force=true to delete all resources and the server, or delete resources manually first.'], 400);
         }
-        if ($server->isLocalhost()) {
+        if ($server->is_coolify_host) {
             return response()->json(['message' => 'Local server cannot be deleted.'], 400);
         }
 
@@ -962,6 +985,12 @@ class ServersController extends Controller
             return response()->json(['message' => 'Server not found.'], 404);
         }
         $this->authorize('update', $server);
+
+        if (! $server->canBeValidated()) {
+            return response()->json([
+                'message' => 'This server was transferred to another Coolify instance and cannot be revalidated here.',
+            ], 422);
+        }
 
         $validator = customApiValidator($request->all(), [
             'install' => 'boolean',

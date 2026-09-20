@@ -14,8 +14,8 @@ services:
       - "host.docker.internal:host-gateway"
     environment:
       AUTORUN_ENABLED: false
-      PUSHER_HOST: "${PUSHER_HOST}"
-      PUSHER_PORT: "${PUSHER_PORT}"
+      PUSHER_HOST: "${PUSHER_HOST:-}"
+      PUSHER_PORT: "${PUSHER_PORT:-}"
       PUSHER_SCHEME: "${PUSHER_SCHEME:-http}"
       PUSHER_APP_ID: "${PUSHER_APP_ID:-coolify}"
       PUSHER_APP_KEY: "${PUSHER_APP_KEY:-coolify}"
@@ -162,7 +162,7 @@ services:
     networks:
       - coolify
   # maxio-init:
-  #   image: minio/mc:latest
+  #   image: ghcr.io/coollabsio/mx:0.1.0
   #   pull_policy: always
   #   container_name: coolify-maxio-init
   #   restart: no
@@ -182,7 +182,7 @@ services:
   #   networks:
   #     - coolify
   minio-init:
-    image: minio/mc:latest
+    image: ghcr.io/coollabsio/mx:0.1.0
     pull_policy: always
     container_name: coolify-minio-init
     restart: no

@@ -29,13 +29,15 @@ class ExecuteContainerCommand extends Component
 
     public bool $isConnecting = false;
 
+    public bool $containersLoaded = false;
+
     protected $rules = [
         'server' => 'required',
         'container' => 'required',
         'command' => 'required',
     ];
 
-    public function mount()
+    public function mount(): void
     {
         $this->parameters = get_route_parameters();
         $this->containers = collect();
@@ -52,7 +54,6 @@ class ExecuteContainerCommand extends Component
                     $this->servers = $this->servers->push($server);
                 }
             }
-            $this->loadContainers();
         } elseif (data_get($this->parameters, 'database_uuid')) {
             $this->type = 'database';
             $resource = getResourceByUuid($this->parameters['database_uuid'], data_get(auth()->user()->currentTeam(), 'id'));
@@ -64,26 +65,32 @@ class ExecuteContainerCommand extends Component
             if ($this->resource->destination->server->isFunctional()) {
                 $this->servers = $this->servers->push($this->resource->destination->server);
             }
-            $this->loadContainers();
         } elseif (data_get($this->parameters, 'service_uuid')) {
             $this->type = 'service';
             $this->resource = Service::ownedByCurrentTeam()->where('uuid', $this->parameters['service_uuid'])->firstOrFail();
             $this->authorize('view', $this->resource);
+            if (! $this->resource->isRunning()) {
+                $this->containersLoaded = true;
+            }
             if ($this->resource->server->isFunctional()) {
                 $this->servers = $this->servers->push($this->resource->server);
             }
-            $this->loadContainers();
         } elseif (data_get($this->parameters, 'server_uuid')) {
             $this->type = 'server';
             $this->resource = Server::ownedByCurrentTeam()->where('uuid', $this->parameters['server_uuid'])->firstOrFail();
             $this->authorize('view', $this->resource);
             $this->servers = $this->servers->push($this->resource);
+            $this->containersLoaded = true;
         }
         $this->servers = $this->servers->sortByDesc(fn ($server) => $server->isTerminalEnabled());
     }
 
-    public function loadContainers()
+    public function loadContainers(): void
     {
+        if ($this->containersLoaded) {
+            return;
+        }
+
         foreach ($this->servers as $server) {
             if (data_get($this->parameters, 'application_uuid')) {
                 if ($server->isSwarm()) {
@@ -144,8 +151,16 @@ class ExecuteContainerCommand extends Component
         });
 
         if ($this->containers->count() === 1) {
-            $this->selected_container = data_get($this->containers->first(), 'container.Names');
+            $this->selected_container = $this->containerTarget($this->containers->first());
+            $this->connectToContainer();
         }
+
+        $this->containersLoaded = true;
+    }
+
+    private function containerTarget(array $container): string
+    {
+        return data_get($container, 'server.uuid').':'.data_get($container, 'container.Names');
     }
 
     public function updatedSelectedContainer()
@@ -192,12 +207,12 @@ class ExecuteContainerCommand extends Component
         try {
             $this->authorize('canAccessTerminal');
             // Validate container name format
-            if (! ValidationPatterns::isValidContainerName($this->selected_container)) {
+            if (! ValidationPatterns::isValidContainerName(str($this->selected_container)->after(':')->value())) {
                 throw new \InvalidArgumentException('Invalid container name format');
             }
 
             // Verify container exists in our allowed list
-            $container = collect($this->containers)->firstWhere('container.Names', $this->selected_container);
+            $container = $this->containers->first(fn ($candidate) => $this->containerTarget($candidate) === $this->selected_container);
             if (is_null($container)) {
                 throw new \RuntimeException('Container not found.');
             }
